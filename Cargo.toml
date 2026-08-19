@@ -1,0 +1,38 @@
+[package]
+name = "codemode"
+version = "0.1.0"
+edition = "2021"
+description = "Code mode CLI: run a Rhai script as one sandboxed batch of file/shell primitives instead of N separate tool-calls."
+license = "MIT"
+
+[[bin]]
+name = "codemode"
+path = "src/main.rs"
+
+[dependencies]
+rhai = { version = "1.19", features = ["sync"] }
+glob = "0.3"
+clap = { version = "4", features = ["derive"] }
+shell-words = "1"
+# In-process filter calls instead of spawning the rtk binary -- see
+# src/primitives.rs's run_shell_impl for why (measured: spawning rtk costs
+# 3.5-13ms depending on path, more than some filtered commands cost raw).
+rtk = { git = "https://github.com/thurionapp/rtk", branch = "develop" }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+# Startup is dominated by binary load (measured: ~4.1ms of a ~5ms noop run
+# is spent before the Rhai engine even starts; the engine itself costs
+# ~0.85ms) -- so binary size IS startup latency here. strip cuts the debug
+# symbols the release binary was still carrying; codegen-units=1 lets LTO
+# see the whole program and drop more of rtk's dep tree (rusqlite/chrono/
+# unicode tables) that the filters-only usage never reaches.
+strip = true
+codegen-units = 1
+panic = "abort"
