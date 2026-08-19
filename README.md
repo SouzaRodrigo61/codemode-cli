@@ -127,6 +127,15 @@ one actually seen in real production review scripts).
 - `read_file(path) -> String` — errors clearly if the file doesn't exist
   or isn't valid UTF-8.
 - `write_file(path, content)` — creates parent directories as needed.
+  **Refuses** to replace an existing file with content less than half its
+  size: that shape is a wipe, not an update (see *Known traps* below).
+- `write_file_force(path, content)` — same thing without the shrink
+  guard, for when replacing a file with something much smaller is the
+  actual intent.
+- `append_file(path, content)` — appends, creating the file if needed.
+  Use this instead of `read_file` + `write_file` whenever the goal is
+  "add text to these files": there is no read step to get wrong, so
+  nothing already in the file can be lost.
 - `edit_file(path, old, new)` — same safety semantics as the Claude Code
   `Edit` tool: fails if `old` isn't found, and fails if `old` matches
   more than once (ambiguous replace refused, not silently applied to the
@@ -188,8 +197,36 @@ one actually seen in real production review scripts).
   `PATH`, otherwise falls back to a simple in-process substring search.
   Restricted to the sandbox workdir.
 - `glob(pattern) -> Array` — via the `glob` crate, restricted to the
-  sandbox workdir; every match is re-validated against the sandbox
-  before being returned.
+  sandbox workdir; every match is canonicalized and re-validated against
+  the sandbox before being returned, so results are always paths
+  `read_file`/`write_file`/`edit_file` accept.
+
+## Known traps
+
+Paid for already — don't rediscover them:
+
+- **Never emulate append with `read_file` + `write_file` over a batch.**
+  `write_file` replaces the *whole* file, so any script bug that makes
+  the assembled string shorter erases the rest of it — silently, across
+  every file in the loop. This happened for real on 2026-08-19: 70
+  markdown files reduced to just the block that was supposed to be
+  appended. Use `append_file` to add, `edit_file` with an exact anchor to
+  change part of a file, and run a batch on ONE file before running it on
+  all of them. `write_file`'s shrink guard now refuses the wipe shape, but
+  the guard is the backstop, not the plan.
+- **30s watchdog.** Default timeout is 30s (hard cap 120s). Test suites
+  and builds belong in the shell directly, not inside a script.
+- **Rhai is not JavaScript and not Rust.** No single-quoted strings and no
+  `${}` interpolation outside backtick strings; functions are `fn`, not
+  `function`; closures are `|x| expr`, not `x => expr`; no `let mut`, no
+  `format!`, no `console.log`, no `require`/`import`. A failing script
+  prints targeted hints for these.
+- **`run_shell_full(cmd)`** returns `#{stdout, stderr, exit_code,
+  success}` — use it when the script has to branch on the result;
+  `run_shell` errors on failure instead.
+- **Glob metacharacters in literal directory names** (`[id]`, `?`) are
+  interpreted as patterns, so `glob("[id]/*.md")` matches nothing rather
+  than the directory literally named `[id]`.
 
 ## Script library: `.codemode/` per repo
 

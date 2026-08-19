@@ -154,6 +154,59 @@ fn write_file_impl(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), B
     fs::write(&resolved, content).map_err(|e| to_err(format!("write_file: {:?}: {e}", path)))
 }
 
+/// A full overwrite that shrinks an existing file to less than this
+/// fraction of its size is refused. On 2026-08-19 a batch script whose
+/// in-script content assembly came out empty ran `write_file(f, atual +
+/// bloco)` over 70 files and replaced every one of them with just
+/// `bloco`: `write_file` replaces the whole file, so ANY upstream bug
+/// producing a shorter string is silent, total data loss. The read side
+/// already fails loud (`read_file` errors, never returns ""), so the
+/// remaining hole was the write side trusting whatever it was handed.
+/// Half is deliberately coarse: it never fires on a normal rewrite and
+/// always fires on a wipe.
+fn shrinks_dangerously(old_len: u64, new_len: u64) -> bool {
+    old_len > 0 && new_len.saturating_mul(2) < old_len
+}
+
+fn write_file_guarded(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), Box<EvalAltResult>> {
+    let resolved = sandbox.resolve(path).map_err(to_err)?;
+    if let Ok(meta) = fs::metadata(&resolved) {
+        if meta.is_file() && shrinks_dangerously(meta.len(), content.len() as u64) {
+            return Err(to_err(format!(
+                "write_file: recusado — {:?} tem {} bytes e o conteúdo novo tem {} \
+                 (menos da metade): isso apaga o arquivo em vez de atualizá-lo. \
+                 Use append_file(path, texto) pra acrescentar, edit_file(path, velho, novo) \
+                 pra trocar um trecho, ou write_file_force(path, conteudo) se a substituição \
+                 total for mesmo intencional.",
+                path,
+                meta.len(),
+                content.len()
+            )));
+        }
+    }
+    write_file_impl(sandbox, path, content)
+}
+
+// ---- append_file ----
+
+/// The safe way to add to a file: no read step to get wrong, and nothing
+/// existing can be lost. This is what a `read_file` + `write_file`
+/// "append" loop should have been.
+fn append_file_impl(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), Box<EvalAltResult>> {
+    use std::io::Write as _;
+    let resolved = sandbox.resolve(path).map_err(to_err)?;
+    if let Some(parent) = resolved.parent() {
+        fs::create_dir_all(parent).map_err(|e| to_err(format!("append_file: cannot create {:?}: {e}", parent)))?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&resolved)
+        .map_err(|e| to_err(format!("append_file: {:?}: {e}", path)))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| to_err(format!("append_file: {:?}: {e}", path)))
+}
+
 // ---- edit_file ----
 
 fn edit_file_impl(sandbox: &Sandbox, path: &str, old: &str, new: &str) -> Result<(), Box<EvalAltResult>> {
@@ -708,13 +761,22 @@ fn glob_impl(sandbox: &Sandbox, pattern: &str) -> Result<Array, Box<EvalAltResul
     let mut out = Array::new();
     let paths = glob::glob(&full_pattern_str).map_err(|e| to_err(format!("glob: invalid pattern: {e}")))?;
     for entry in paths.flatten() {
-        // Re-validate every match stays inside the sandbox (defense in depth).
-        if let Ok(canon) = fs::canonicalize(&entry) {
-            if !canon.starts_with(&sandbox.root) {
-                continue;
-            }
-        }
-        let rel = entry.strip_prefix(&sandbox.root).unwrap_or(&entry);
+        // Canonicalize BEFORE stripping, not just to re-validate. The
+        // pattern may have been given through a symlinked prefix (on
+        // macOS `/tmp` is a symlink to `/private/tmp`), in which case
+        // `entry` is not under the canonical root at all: `strip_prefix`
+        // fails and the old `.unwrap_or(&entry)` fallback handed back the
+        // raw absolute path -- a path every sibling primitive
+        // (`read_file`, `write_file`) then refuses as "outside sandbox".
+        // `glob` must only ever return paths its siblings accept.
+        let canon = match fs::canonicalize(&entry) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let rel = match canon.strip_prefix(&sandbox.root) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
         out.push(rhai::Dynamic::from(rel.to_string_lossy().to_string()));
     }
     Ok(out)
@@ -735,7 +797,17 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>)
 
     let sb = sandbox.clone();
     engine.register_fn("write_file", move |path: &str, content: &str| -> Result<(), Box<EvalAltResult>> {
+        write_file_guarded(&sb, path, content)
+    });
+
+    let sb = sandbox.clone();
+    engine.register_fn("write_file_force", move |path: &str, content: &str| -> Result<(), Box<EvalAltResult>> {
         write_file_impl(&sb, path, content)
+    });
+
+    let sb = sandbox.clone();
+    engine.register_fn("append_file", move |path: &str, content: &str| -> Result<(), Box<EvalAltResult>> {
+        append_file_impl(&sb, path, content)
     });
 
     let sb = sandbox.clone();

@@ -631,3 +631,146 @@ fn script_args_reach_script_as_args_constant() {
         .success()
         .stdout(predicates::str::contains("n=2 a=77 b=owner/repo"));
 }
+
+// ---------------------------------------------------------------------
+// Regression: the 2026-08-19 batch that zeroed 70 markdown files.
+// The shape was `glob()` -> `read_file()` -> `write_file(f, atual + bloco)`.
+// Three separate things had to hold for that to be safe, so each gets a
+// test: glob must return paths read_file accepts, read_file must never
+// answer "" for a file it couldn't read, and write_file must refuse a
+// replacement that erases the file.
+// ---------------------------------------------------------------------
+
+/// The exact loop, on files with real content: every original must
+/// survive, with the block appended -- not replaced by it.
+#[test]
+fn append_loop_over_globbed_files_preserves_content() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("docs")).unwrap();
+    for i in 0..3 {
+        fs::write(
+            dir.path().join("docs").join(format!("f{i}.md")),
+            format!("conteudo original {i}\nlinha dois\n"),
+        )
+        .unwrap();
+    }
+    let script = dir.path().join("s.rhai");
+    fs::write(
+        &script,
+        r#"
+let bloco = "\n<!-- marcador -->\nBLOCO\n";
+for f in glob("docs/*.md") {
+    let atual = read_file(f);
+    if atual.contains("marcador") { } else { write_file(f, atual + bloco); }
+}
+"#,
+    )
+    .unwrap();
+
+    cmd().arg("run").arg(&script).arg("--workdir").arg(dir.path()).assert().success();
+
+    for i in 0..3 {
+        let got = fs::read_to_string(dir.path().join("docs").join(format!("f{i}.md"))).unwrap();
+        assert!(got.starts_with(&format!("conteudo original {i}")), "original erased: {got:?}");
+        assert!(got.contains("BLOCO"), "block not appended: {got:?}");
+    }
+}
+
+/// `glob` must hand back paths the sibling primitives accept. Reached
+/// through a symlinked workdir, which is the everyday case on macOS
+/// (`/tmp` -> `/private/tmp`) and used to make `glob` return raw absolute
+/// paths that `read_file` then refused as "outside sandbox".
+#[cfg(unix)]
+#[test]
+fn glob_results_are_readable_through_a_symlinked_workdir() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("a.md"), "ORIGINAL\n").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let script = dir.path().join("s.rhai");
+    fs::write(
+        &script,
+        r#"for f in glob("*.md") { print(f + ":" + read_file(f).len()); }"#,
+    )
+    .unwrap();
+
+    cmd()
+        .arg("run")
+        .arg(&script)
+        .arg("--workdir")
+        .arg(&link)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("a.md:9"));
+}
+
+/// read_file never answers with "" for a file it could not read -- the
+/// silence is what turned a script bug into data loss.
+#[test]
+fn read_file_errors_instead_of_returning_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"print("[" + read_file("nope.md") + "]");"#).unwrap();
+
+    cmd()
+        .arg("run")
+        .arg(&script)
+        .arg("--workdir")
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("does not exist"));
+}
+
+/// A write that would replace a file with a fraction of its content is
+/// refused, and the file on disk is untouched.
+#[test]
+fn write_file_refuses_to_wipe_an_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.md");
+    fs::write(&target, "conteudo original bem mais longo que o bloco\n").unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"write_file("f.md", "BLOCO\n");"#).unwrap();
+
+    cmd()
+        .arg("run")
+        .arg(&script)
+        .arg("--workdir")
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("recusado"));
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "conteudo original bem mais longo que o bloco\n");
+}
+
+/// ...but a deliberate replacement still has a way through.
+#[test]
+fn write_file_force_replaces_anyway() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.md");
+    fs::write(&target, "conteudo original bem mais longo que o bloco\n").unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"write_file_force("f.md", "BLOCO\n");"#).unwrap();
+
+    cmd().arg("run").arg(&script).arg("--workdir").arg(dir.path()).assert().success();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "BLOCO\n");
+}
+
+/// append_file is the primitive that makes the read+write dance
+/// unnecessary in the first place.
+#[test]
+fn append_file_adds_without_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.md");
+    fs::write(&target, "ORIGINAL\n").unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"append_file("f.md", "BLOCO\n"); append_file("novo.md", "X\n");"#).unwrap();
+
+    cmd().arg("run").arg(&script).arg("--workdir").arg(dir.path()).assert().success();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "ORIGINAL\nBLOCO\n");
+    assert_eq!(fs::read_to_string(dir.path().join("novo.md")).unwrap(), "X\n");
+}
