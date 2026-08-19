@@ -12,8 +12,7 @@ and only the consolidated result comes back into the model's context.
 
 Not an MCP server. Not a resident process. No `@modelcontextprotocol/sdk`,
 no protocol handshake, nothing to register. It is a compiled binary you
-invoke via `Bash`/`exec`, same as [`rtk`](https://github.com/thurionapp)
-elsewhere in this org: it runs, does the work, exits, frees memory.
+invoke via `Bash`/`exec`, same as [`rtk`](https://github.com/SouzaRodrigo61/rtk): it runs, does the work, exits, frees memory.
 
 Not tied to any one workspace or agent product, either. The core primitives
 (`read_file`/`write_file`/`edit_file`/`run_shell`/`grep`/`glob`) have no
@@ -100,7 +99,7 @@ it's a one-line documentation change plus the binary being on `PATH`.
 `run_shell` had two tiers already (a routing allowlist, `rtk`-worth-it commands only) —
 now it has three. For commands with a migrated filter (currently: `cargo test`), codemode
 calls `rtk::filters::cargo_test` **in-process**, as a real dependency on
-[`thurionapp/rtk`](https://github.com/thurionapp/rtk) (`[lib]` target added specifically
+[`thurionapp/rtk`](https://github.com/SouzaRodrigo61/rtk) (`[lib]` target added specifically
 for this), instead of spawning the `rtk` binary at all. Measured: the pure filtering step
 went from **5.31ms (spawn `rtk`, pipe through `rtk pipe -f cargo-test`) to 0.0055ms
 in-process — ~965× faster** for the filtering itself (`cargo run --release --example
@@ -135,7 +134,7 @@ one actually seen in real production review scripts).
 - `run_shell(cmd) -> String` — runs via `sh -c`, cwd locked to the
   sandbox workdir, stdout+stderr captured. Refuses commands matching the
   denylist below unless called as `run_shell(cmd, #{confirm: true})` or
-  `run_shell_confirmed(cmd)`. **Auto-routed through [`rtk`](https://github.com/thurionapp/rtk)
+  `run_shell_confirmed(cmd)`. **Auto-routed through [`rtk`](https://github.com/SouzaRodrigo61/rtk)
   when it's on PATH, `cmd` is a single plain command** (no `|`/`&&`/`;`/
   `>`/`<`/`` ` ``/`$(`), **and the first word is a known-heavy tool**
   (`cargo`, `npm`/`npx`/`pnpm`/`yarn`, `go`, `mvn`/`gradle`, `dotnet`,

@@ -17,7 +17,7 @@ shell-words = "1"
 # In-process filter calls instead of spawning the rtk binary -- see
 # src/primitives.rs's run_shell_impl for why (measured: spawning rtk costs
 # 3.5-13ms depending on path, more than some filtered commands cost raw).
-rtk = { git = "https://github.com/thurionapp/rtk", branch = "develop" }
+rtk = { git = "https://github.com/SouzaRodrigo61/rtk", branch = "develop" }
 
 [dev-dependencies]
 assert_cmd = "2"
