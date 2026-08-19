@@ -857,6 +857,17 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>)
     engine.register_fn("glob", move |pattern: &str| -> Result<Array, Box<EvalAltResult>> {
         glob_impl(&sb, pattern)
     });
+
+    // Rhai's own `replace` MUTATES the string in place and returns unit, so
+    // `let novo = velho.replace(a, b)` silently binds `()` -- and `() + texto`
+    // is just `texto`. That is exactly how a batch script wiped 70 files on
+    // 2026-08-19: the read worked, the assembly evaluated to the new block
+    // alone, and the write replaced every file with it. Rather than only
+    // guarding the write, give scripts the non-mutating form they were
+    // reaching for.
+    engine.register_fn("replaced", |s: &str, old: &str, new: &str| -> String {
+        s.replace(old, new)
+    });
 }
 
 #[cfg(test)]

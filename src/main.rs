@@ -135,6 +135,12 @@ fn read_script(script: &str, workdir: &PathBuf) -> Result<String, String> {
 
 fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize, verbose: bool, allow_hosts: Vec<String>, script_args: Vec<String>) -> Result<i32, String> {
     let source = read_script(script_arg, workdir)?;
+
+    // Fires before the script runs, and regardless of whether it succeeds:
+    // the write-wipe incident this guards against never errored.
+    for w in mutating_method_warnings(&source) {
+        eprintln!("codemode: aviso: {w}");
+    }
     let sandbox = Sandbox::new(workdir)?;
 
     let mut engine = Engine::new();
@@ -261,6 +267,38 @@ fn foreign_idiom_hints(source: &str) -> Vec<&'static str> {
         .map(|(_, hint)| *hint)
         .take(3)
         .collect()
+}
+
+/// Warns about assigning the result of a Rhai method that mutates in place
+/// and returns unit. Unlike `foreign_idiom_hints`, this runs BEFORE the
+/// script and on the SUCCESS path too -- the 2026-08-19 incident that wiped
+/// 70 files never errored, so a failure-only hint would never have fired.
+fn mutating_method_warnings(source: &str) -> Vec<String> {
+    const MUTATORS: &[&str] = &["replace", "push", "pad", "crop", "truncate", "remove", "reverse"];
+    let re_ok = |line: &str| line.trim_start().starts_with("//");
+    let mut out = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        if re_ok(line) {
+            continue;
+        }
+        for m in MUTATORS {
+            let needle = format!(".{m}(");
+            if let Some(at) = line.find(&needle) {
+                let before = &line[..at];
+                let assigns = before.contains('=') && !before.contains("==") && !before.contains("!=");
+                if assigns {
+                    out.push(format!(
+                        "linha {}: `{}` MUTA em lugar e devolve () — atribuir isso dá unit, não string. \
+                         Para `replace`, use replaced(s, velho, novo); para os outros, mute a variável e use ela mesma.",
+                        i + 1,
+                        m
+                    ));
+                }
+            }
+        }
+    }
+    out.truncate(3);
+    out
 }
 
 fn detect_host_sandbox() -> Option<String> {

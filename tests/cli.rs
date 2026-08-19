@@ -774,3 +774,41 @@ fn append_file_adds_without_reading() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "ORIGINAL\nBLOCO\n");
     assert_eq!(fs::read_to_string(dir.path().join("novo.md")).unwrap(), "X\n");
 }
+
+/// The 2026-08-19 wipe went through a `let novo = atual.replace(a, b)`:
+/// Rhai's `replace` mutates in place and returns unit, so `novo` was `()`
+/// and `() + bloco` was just `bloco`. Two things had to change: a
+/// non-mutating `replaced()` for scripts to reach for, and a warning that
+/// fires BEFORE the run -- the incident never errored, so anything wired to
+/// the failure path would have stayed silent.
+#[test]
+fn replaced_returns_a_new_string_and_mutating_replace_is_warned() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "VELHO conteudo aqui\n").unwrap();
+    let script = dir.path().join("s.rhai");
+    std::fs::write(
+        &script,
+        r#"
+let atual = read_file("a.txt");
+let bugado = atual.replace("VELHO", "NOVO");
+print("bugado_len=" + type_of(bugado));
+print("certo=" + replaced(atual, "VELHO", "NOVO"));
+"#,
+    )
+    .unwrap();
+
+    let out = cmd()
+        .args(["run", script.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "script deveria rodar: {stderr}");
+    assert!(stdout.contains("bugado_len=()"), "replace devia devolver unit: {stdout}");
+    assert!(stdout.contains("certo=NOVO conteudo aqui"), "replaced devia devolver string nova: {stdout}");
+    assert!(
+        stderr.contains("MUTA em lugar") && stderr.contains("linha 3"),
+        "o aviso devia apontar a linha do replace atribuído: {stderr}"
+    );
+}

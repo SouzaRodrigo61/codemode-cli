@@ -136,6 +136,12 @@ one actually seen in real production review scripts).
   Use this instead of `read_file` + `write_file` whenever the goal is
   "add text to these files": there is no read step to get wrong, so
   nothing already in the file can be lost.
+- `replaced(s, old, new) -> String` — non-mutating string replace. Rhai's
+  own `s.replace(a, b)` mutates `s` in place and returns **unit**, so
+  `let new = s.replace(a, b)` binds `()` and `() + text` collapses to
+  `text`. Reach for `replaced` whenever you want a new string back; the
+  runtime also warns, before running, when a script assigns the result of
+  a mutating method.
 - `edit_file(path, old, new)` — same safety semantics as the Claude Code
   `Edit` tool: fails if `old` isn't found, and fails if `old` matches
   more than once (ambiguous replace refused, not silently applied to the
