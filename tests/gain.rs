@@ -166,10 +166,13 @@ fn gain_reporta_calls_evitadas_e_buckets() {
     run_in(home.path(), dir.path(), r#"run_shell("true"); run_shell("true"); run_shell("true");"#).success();
     run_in(home.path(), dir.path(), r#"run_shell("true");"#).success();
 
+    // Workdir de teste é tempdir, e tempdir é rascunho -- então o relatório
+    // padrão (trabalho real) NÃO conta estas execuções, e `--bench` conta.
+    // É a segmentação do #59 funcionando, não efeito colateral.
     let out = Command::cargo_bin("codemode")
         .unwrap()
         .env("CODEMODE_HOME", home.path())
-        .arg("gain")
+        .args(["gain", "--bench"])
         .assert()
         .success();
     let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
@@ -180,7 +183,7 @@ fn gain_reporta_calls_evitadas_e_buckets() {
     let out = Command::cargo_bin("codemode")
         .unwrap()
         .env("CODEMODE_HOME", home.path())
-        .args(["gain", "--json"])
+        .args(["gain", "--json", "--bench"])
         .assert()
         .success();
     let j: serde_json::Value =
@@ -213,7 +216,7 @@ fn gain_history_lista_execucoes() {
     Command::cargo_bin("codemode")
         .unwrap()
         .env("CODEMODE_HOME", home.path())
-        .args(["gain", "--history"])
+        .args(["gain", "--history", "--bench"])
         .assert()
         .success()
         .stdout(predicates::str::contains("Últimas"));
@@ -222,7 +225,7 @@ fn gain_history_lista_execucoes() {
 #[test]
 fn linha_corrompida_no_log_nao_quebra_o_relatorio() {
     let home = tempfile::tempdir().unwrap();
-    fs::write(home.path().join("runs.jsonl"), "{lixo\n{\"ts\":1,\"script\":\"a\",\"source\":\"file\",\"prims\":{\"run_shell\":2},\"prim_total\":2,\"out_bytes\":0,\"exit_code\":0,\"ms\":1,\"workdir\":\"/tmp\"}\n").unwrap();
+    fs::write(home.path().join("runs.jsonl"), "{lixo\n{\"ts\":1,\"script\":\"a\",\"source\":\"file\",\"prims\":{\"run_shell\":2},\"prim_total\":2,\"out_bytes\":0,\"exit_code\":0,\"ms\":1,\"workdir\":\"/tmp\",\"kind\":\"real\"}\n").unwrap();
 
     let out = Command::cargo_bin("codemode")
         .unwrap()
@@ -232,4 +235,130 @@ fn linha_corrompida_no_log_nao_quebra_o_relatorio() {
         .success();
     let j: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(j["runs"], 1, "a linha corrompida é descartada, o resto conta");
+}
+
+// ---------------------------------------------------------------------------
+// #59 -- segmentação: o relatório é sobre trabalho real, e bench/rascunho/self
+// entram numa conta separada. Sem isso, na máquina onde a issue foi medida,
+// 1.303 de 1.312 execuções eram o próprio codemode e o ganho saía inflado 145x.
+// ---------------------------------------------------------------------------
+
+/// Diretório que simula um repo de trabalho de verdade: fora de qualquer raiz
+/// temporária (`CARGO_TARGET_TMPDIR` vive sob `target/`) e com `Cargo.toml`
+/// próprio de OUTRO crate -- sem ele o probe sobe a árvore, encontra o
+/// `Cargo.toml` do próprio codemode e classifica como "self", corretamente.
+fn dir_de_trabalho(nome: &str) -> std::path::PathBuf {
+    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(nome);
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("Cargo.toml"), "[package]\nname = \"app-de-teste\"\n").unwrap();
+    base
+}
+
+#[test]
+fn execucao_em_repo_de_trabalho_e_marcada_como_real() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = dir_de_trabalho("gain_real");
+    run_in(home.path(), &dir, r#"run_shell("true"); run_shell("true");"#).success();
+
+    let l = linhas(home.path());
+    assert_eq!(l[0]["kind"], "real", "workdir normal é trabalho real: {:?}", l[0]);
+
+    let out = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("gain")
+        .assert()
+        .success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(texto.contains("trabalho real"), "{texto}");
+    assert!(texto.contains("Execuções:                   1"), "{texto}");
+}
+
+#[test]
+fn execucao_em_diretorio_temporario_e_rascunho() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    run_in(home.path(), dir.path(), r#"run_shell("true");"#).success();
+
+    let l = linhas(home.path());
+    assert_eq!(l[0]["kind"], "bench", "tempdir é rascunho, não trabalho: {:?}", l[0]);
+
+    // E o relatório padrão diz quantas ficaram de fora, em vez de omitir.
+    let out = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("gain")
+        .assert()
+        .success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(texto.contains("nenhuma execução de trabalho real"), "{texto}");
+    assert!(texto.contains("`codemode gain --bench`"), "{texto}");
+}
+
+#[test]
+fn script_sob_bench_nao_conta_como_trabalho_real() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = dir_de_trabalho("gain_bench_dir");
+    fs::create_dir_all(dir.join("bench").join("casos")).unwrap();
+    fs::write(dir.join("bench/casos/x.rhai"), r#"run_shell("true");"#).unwrap();
+
+    Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("run")
+        .arg(dir.join("bench/casos/x.rhai"))
+        .arg("--workdir")
+        .arg(&dir)
+        .assert()
+        .success();
+
+    let l = linhas(home.path());
+    assert_eq!(l[0]["kind"], "bench", "caso sob bench/ é benchmark: {:?}", l[0]);
+}
+
+#[test]
+fn linha_antiga_com_workdir_apagado_vira_desconhecida_e_nao_real() {
+    // Sem `kind` (linha anterior ao #59) e com o workdir já removido: não dá
+    // para provar o que era. Contar como real era o que inflava o número --
+    // das 36 "reais" da máquina do #59, 27 eram worktrees de dev apagadas.
+    let home = tempfile::tempdir().unwrap();
+    fs::write(
+        home.path().join("runs.jsonl"),
+        "{\"ts\":1,\"script\":\"a\",\"source\":\"file\",\"prims\":{\"run_shell\":2},\
+\"prim_total\":2,\"out_bytes\":0,\"exit_code\":0,\"ms\":1,\
+\"workdir\":\"/nao/existe/mais/worktree-apagada\"}\n",
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("gain")
+        .assert()
+        .success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(texto.contains("Não classificáveis"), "a incerteza aparece: {texto}");
+    assert!(texto.contains("nenhuma execução de trabalho real"), "{texto}");
+}
+
+#[test]
+fn relatorio_expoe_bytes_por_execucao_e_maiores_despejos() {
+    // Byte de contexto é o que custa token; tool-call evitada não paga nada
+    // por si. Um script que evita 10 chamadas e despeja 200KB é prejuízo.
+    let home = tempfile::tempdir().unwrap();
+    let dir = dir_de_trabalho("gain_despejo");
+    fs::write(dir.join("g.txt"), "x".repeat(4000)).unwrap();
+    run_in(home.path(), &dir, r#"print(read_file("g.txt")); run_shell("true");"#).success();
+
+    let out = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("gain")
+        .assert()
+        .success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(texto.contains("Saída por execução:"), "{texto}");
+    assert!(texto.contains("Maiores despejos de contexto"), "{texto}");
+    assert!(texto.contains("s.rhai"), "o despejador é nomeado: {texto}");
 }
