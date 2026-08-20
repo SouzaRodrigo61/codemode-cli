@@ -932,3 +932,128 @@ fn read_file_recusa_chave_desconhecida_em_vez_de_ignorar() {
         .failure()
         .stderr(predicates::str::contains("no other key is supported"));
 }
+
+// ---------------------------------------------------------------------------
+// #63 -- read_files: lista pronta entra, trabalho pesado no Rust, nenhuma
+// closure de Rhai atravessando thread. O custo fixo do codemode ja esta
+// resolvido (0-20ms, nivel bash); o que ainda serializava era leitura de
+// muitos arquivos.
+// ---------------------------------------------------------------------------
+
+fn arquivos_de_teste(dir: &std::path::Path, n: usize) {
+    for i in 0..n {
+        fs::write(dir.join(format!("f{i:03}.txt")), format!("um{i}\ndois\ntres\n")).unwrap();
+    }
+}
+
+#[test]
+fn read_files_devolve_mapa_caminho_para_conteudo() {
+    let dir = tempfile::tempdir().unwrap();
+    arquivos_de_teste(dir.path(), 3);
+    let s = dir.path().join("s.rhai");
+    // Mapa, e nao array: perder a associacao caminho -> conteudo obrigaria
+    // quem chamou a casar por indice, e indice e o que se erra.
+    fs::write(
+        &s,
+        r#"
+let m = read_files(glob("*.txt"));
+print("n=" + m.len());
+print("f001=" + replaced(m["f001.txt"], "\n", "|"));
+"#,
+    )
+    .unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("n=3"))
+        .stdout(predicates::str::contains("f001=um1|dois|tres|"));
+}
+
+#[test]
+fn read_files_aceita_a_mesma_faixa_do_read_file() {
+    let dir = tempfile::tempdir().unwrap();
+    arquivos_de_teste(dir.path(), 2);
+    let s = dir.path().join("s.rhai");
+    fs::write(
+        &s,
+        r#"
+let m = read_files(glob("*.txt"), #{lines: "2-3"});
+print("a=" + replaced(m["f000.txt"], "\n", "|"));
+print("b=" + replaced(m["f001.txt"], "\n", "|"));
+"#,
+    )
+    .unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("a=dois|tres|"))
+        .stdout(predicates::str::contains("b=dois|tres|"));
+}
+
+#[test]
+fn read_files_com_lista_vazia_devolve_mapa_vazio() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(&s, r#"print("n=" + read_files(glob("*.inexistente")).len());"#).unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("n=0"));
+}
+
+#[test]
+fn read_files_falha_inteiro_quando_um_arquivo_falha() {
+    // Devolver o mapa pela metade deixaria o script seguir achando que leu
+    // tudo -- resultado errado sem sinal, a falha que o #60 corrigiu no glob.
+    let dir = tempfile::tempdir().unwrap();
+    arquivos_de_teste(dir.path(), 1);
+    let s = dir.path().join("s.rhai");
+    fs::write(&s, r#"read_files(["f000.txt", "nao-existe.txt"]);"#).unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("does not exist"));
+}
+
+#[test]
+fn read_files_respeita_o_sandbox_como_read_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(&s, r#"read_files(["../../etc/passwd"]);"#).unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn read_files_conta_uma_primitiva_por_arquivo_na_telemetria() {
+    // `read_files` de N arquivos substituiu N tool-calls, nao uma. Contar 1
+    // faria o script parecer nao ter colapsado nada -- justamente o numero
+    // que o #59 existe para acertar.
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    arquivos_de_teste(dir.path(), 4);
+    let s = dir.path().join("s.rhai");
+    fs::write(&s, r#"read_files(glob("*.txt"));"#).unwrap();
+
+    Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    let raw = fs::read_to_string(home.path().join("runs.jsonl")).unwrap();
+    let e: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+    assert_eq!(e["prims"]["read_files"], 4, "quatro arquivos, quatro primitivas: {e:?}");
+}

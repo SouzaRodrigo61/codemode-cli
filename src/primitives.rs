@@ -223,6 +223,117 @@ fn read_file_faixa(
     Ok(out)
 }
 
+/// `read_files(lista)` / `read_files(lista, #{lines: "i-j"})` -- le a lista
+/// inteira em paralelo e devolve um mapa caminho -> conteudo.
+///
+/// Existe porque o custo fixo do codemode ja esta resolvido (medido em 0-20ms,
+/// nivel `bash`), e o que ainda serializa e leitura de MUITOS arquivos:
+/// `parallel_shell` cobre comando externo, mas closure de Rhai nao atravessa
+/// thread no modelo atual -- foi por isso que o v1.0 trocou
+/// `parallel(itens, |x| ...)` por `parallel_shell(lista)` (#63).
+///
+/// A saida e contorna a limitacao em vez de brigar com ela: a lista entra
+/// pronta, o trabalho pesado acontece no Rust, e nenhuma closure cruza
+/// fronteira. Mesma forma de `glob` e `grep`, que ja sao nativos.
+///
+/// Mapa, e nao array, porque perder a associacao caminho -> conteudo obrigaria
+/// quem chamou a casar por indice -- e indice e exatamente o que se erra.
+fn read_files_impl(
+    sandbox: &Sandbox,
+    caminhos: Array,
+    faixa: Option<&str>,
+) -> Result<Map, Box<EvalAltResult>> {
+    let lista: Vec<String> = caminhos.iter().map(|c| c.to_string()).collect();
+    if lista.is_empty() {
+        return Ok(Map::new());
+    }
+    // Valida a faixa UMA vez, antes de despachar: erro de sintaxe repetido em
+    // N threads viraria N mensagens iguais para o mesmo engano.
+    if let Some(spec) = faixa {
+        faixa_de_linhas(spec)?;
+    }
+
+    let ler = |caminho: &str| -> Result<String, String> {
+        match faixa {
+            Some(spec) => read_file_faixa(sandbox, caminho, spec).map_err(|e| e.to_string()),
+            None => read_file_impl(sandbox, caminho).map_err(|e| e.to_string()),
+        }
+    };
+
+    // O ganho vem do custo POR ARQUIVO (resolve + open + stat), nao dos bytes:
+    // 200 arquivos de 234KB ficaram levemente MAIS LENTOS em paralelo, enquanto
+    // 2.000 arquivos de 50 bytes ficaram 1,40x mais rapidos. Medido nesta
+    // maquina, mediana de 9, duas rodadas alternadas por ponto:
+    //
+    //     50   serial 9,4-11,3ms   paralelo 13,7ms     serial ganha
+    //    200   serial 15,1-16,2    paralelo 17,0-17,3  serial ganha
+    //    400   serial 22,0-23,6    paralelo 21,4-21,6  empate  <- virada
+    //    800   serial 37,7-40,2    paralelo 31,5-32,4  1,20x
+    //   1200   serial 52,1-53,2    paralelo 41,2-41,6  1,26x
+    //   2000   serial 83,1-89,1    paralelo 61,3-61,6  1,40x
+    //
+    // Abaixo da virada o setup de thread custa mais que o trabalho, entao a
+    // leitura e serial e `read_files` vale so pela ergonomia -- que ja e
+    // motivo suficiente para existir.
+    const MINIMO_PARA_PARALELIZAR: usize = 400;
+    if lista.len() < MINIMO_PARA_PARALELIZAR {
+        let mut saida = Map::new();
+        for caminho in &lista {
+            saida.insert(caminho.as_str().into(), ler(caminho).map_err(to_err)?.into());
+        }
+        return Ok(saida);
+    }
+
+    // Fila compartilhada com N threads FIXAS, nao um spawn por bloco: o padrao
+    // em blocos do `parallel_shell` se paga quando cada item custa
+    // milissegundos (processo externo), e nao quando custa microssegundos.
+    let limite =
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(1).min(lista.len());
+    let proximo = std::sync::atomic::AtomicUsize::new(0);
+    let resultados: Vec<std::sync::Mutex<Option<Result<String, String>>>> =
+        (0..lista.len()).map(|_| std::sync::Mutex::new(None)).collect();
+
+    EM_PARALELO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _guarda = GuardaParalelo;
+    std::thread::scope(|escopo| {
+        for _ in 0..limite {
+            let proximo = &proximo;
+            let resultados = &resultados;
+            let lista = &lista;
+            let ler = &ler;
+            escopo.spawn(move || loop {
+                let i = proximo.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= lista.len() {
+                    break;
+                }
+                let r = ler(&lista[i]);
+                if let Ok(mut slot) = resultados[i].lock() {
+                    *slot = Some(r);
+                }
+            });
+        }
+    });
+
+    let mut saida = Map::new();
+    for (caminho, slot) in lista.iter().zip(resultados) {
+        let r = slot
+            .into_inner()
+            .unwrap_or(None)
+            .unwrap_or_else(|| Err("thread do read_files morreu".into()));
+        match r {
+            // Uma leitura que falha derruba a chamada inteira, como `read_file`
+            // faz: devolver o mapa pela metade deixaria o script seguir achando
+            // que leu tudo -- resultado errado sem sinal, a falha que o #60
+            // corrigiu no glob.
+            Ok(conteudo) => {
+                saida.insert(caminho.as_str().into(), conteudo.into());
+            }
+            Err(e) => return Err(to_err(e)),
+        }
+    }
+    Ok(saida)
+}
+
 // ---- write_file ----
 
 fn write_file_impl(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), Box<EvalAltResult>> {
@@ -1499,9 +1610,16 @@ pub fn total_chamadas() -> u64 {
 }
 
 fn bump(c: &Counter, nome: &str) {
-    TOTAL_CHAMADAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    bump_n(c, nome, 1);
+}
+
+/// Uma chamada que faz N operacoes conta N. `read_files` de 200 arquivos
+/// substituiu 200 tool-calls, nao uma -- contar 1 faria o script parecer nao
+/// ter colapsado nada, justamente o numero que o #59 existe para acertar.
+fn bump_n(c: &Counter, nome: &str, n: u64) {
+    TOTAL_CHAMADAS.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut m) = c.lock() {
-        *m.entry(nome.to_string()).or_insert(0) += 1;
+        *m.entry(nome.to_string()).or_insert(0) += n;
     }
 }
 
@@ -1825,6 +1943,31 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>,
         bump(&ct, "read_file");
         read_file_impl(&sb, path)
     });
+
+    // `read_files(lista)` e `read_files(lista, #{lines: "i-j"})` -- leitura em
+    // paralelo, sem closure atravessando thread (#63).
+    let sb = sandbox.clone();
+    let ct = counter.clone();
+    engine.register_fn("read_files", move |caminhos: Array| -> Result<Map, Box<EvalAltResult>> {
+        bump_n(&ct, "read_files", caminhos.len() as u64);
+        read_files_impl(&sb, caminhos, None)
+    });
+
+    let sb = sandbox.clone();
+    let ct = counter.clone();
+    engine.register_fn(
+        "read_files",
+        move |caminhos: Array, opcoes: rhai::Map| -> Result<Map, Box<EvalAltResult>> {
+            bump_n(&ct, "read_files", caminhos.len() as u64);
+            let Some(spec) = opcoes.get("lines") else {
+                return Err(to_err(
+                    "read_files: second argument takes #{lines: \"120-180\"} -- no other key is supported",
+                ));
+            };
+            let spec = spec.to_string();
+            read_files_impl(&sb, caminhos, Some(&spec))
+        },
+    );
 
     // `read_file(caminho, #{lines: "120-180"})` -- mesma primitiva, mesma
     // contagem na telemetria: e a MESMA operacao, so que sem pagar o arquivo
