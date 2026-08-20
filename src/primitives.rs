@@ -1297,34 +1297,91 @@ fn grep_impl(sandbox: &Sandbox, pattern: &str, path: &str) -> Result<String, Box
 
 // ---- glob ----
 
+/// Prefixo literal do padrao: tudo antes do primeiro curinga. E o que o
+/// chamador pediu EXPLICITAMENTE, e por isso manda mais que o .gitignore.
+fn prefixo_literal(pattern: &str) -> &str {
+    match pattern.find(['*', '?', '[']) {
+        Some(i) => match pattern[..i].rfind('/') {
+            Some(barra) => &pattern[..barra],
+            None => "",
+        },
+        None => pattern,
+    }
+}
+
+/// O caminho esta sob algo que o .gitignore exclui?
+fn caminho_ignorado(raiz: &std::path::Path, alvo: &std::path::Path) -> bool {
+    let Ok(gitignore) = ignore::gitignore::GitignoreBuilder::new(raiz).build() else {
+        return false;
+    };
+    let mut atual = alvo;
+    loop {
+        if let Ok(rel) = atual.strip_prefix(raiz) {
+            if !rel.as_os_str().is_empty()
+                && gitignore.matched_path_or_any_parents(rel, atual.is_dir()).is_ignore()
+            {
+                return true;
+            }
+        }
+        match atual.parent() {
+            Some(p) if p.starts_with(raiz) && p != raiz => atual = p,
+            _ => return false,
+        }
+    }
+}
+
+/// Mesma regra do `grep` (#28), e pelo mesmo motivo: o `.gitignore` governa
+/// onde a gente entra SOZINHO, nunca o que foi pedido pelo nome.
+///
+/// Medido neste repo (3,1 GB de `target/`): `glob("**/*.rs")` devolvia 48
+/// arquivos em 65ms -- 38 deles artefato de build que ninguem queria. Agora
+/// devolve os 10 do codigo. Quem realmente quer o que esta ignorado pede
+/// pelo nome: `glob("target/**/*.rs")` continua entrando la, porque ai a
+/// escolha e explicita.
 fn glob_impl(sandbox: &Sandbox, pattern: &str) -> Result<Array, Box<EvalAltResult>> {
     if pattern.contains("..") {
         return Err(to_err("glob: `..` is not allowed in patterns"));
     }
-    let full_pattern = sandbox.root.join(pattern);
-    let full_pattern_str = full_pattern.to_string_lossy().to_string();
-    let mut out = Array::new();
-    let paths = glob::glob(&full_pattern_str).map_err(|e| to_err(format!("glob: invalid pattern: {e}")))?;
-    for entry in paths.flatten() {
-        // Canonicalize BEFORE stripping, not just to re-validate. The
-        // pattern may have been given through a symlinked prefix (on
-        // macOS `/tmp` is a symlink to `/private/tmp`), in which case
-        // `entry` is not under the canonical root at all: `strip_prefix`
-        // fails and the old `.unwrap_or(&entry)` fallback handed back the
-        // raw absolute path -- a path every sibling primitive
-        // (`read_file`, `write_file`) then refuses as "outside sandbox".
-        // `glob` must only ever return paths its siblings accept.
-        let canon = match fs::canonicalize(&entry) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let rel = match canon.strip_prefix(&sandbox.root) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        out.push(rhai::Dynamic::from(rel.to_string_lossy().to_string()));
+
+    let prefixo = prefixo_literal(pattern);
+    let inicio = if prefixo.is_empty() {
+        sandbox.root.clone()
+    } else {
+        sandbox.resolve(prefixo).map_err(to_err)?
+    };
+    if !inicio.exists() {
+        return Ok(Array::new());
     }
-    Ok(out)
+    let pediu_ignorado = !prefixo.is_empty() && caminho_ignorado(&sandbox.root, &inicio);
+
+    let padrao =
+        glob::Pattern::new(pattern).map_err(|e| to_err(format!("glob: invalid pattern: {e}")))?;
+    let opcoes = glob::MatchOptions { require_literal_separator: true, ..Default::default() };
+
+    let mut construtor = ignore::WalkBuilder::new(&inicio);
+    construtor
+        .git_ignore(!pediu_ignorado)
+        .git_global(false)
+        .git_exclude(!pediu_ignorado)
+        .hidden(false);
+
+    let mut out: Vec<String> = Vec::new();
+    for entrada in construtor.build().flatten() {
+        if entrada.file_name() == ".git" {
+            continue;
+        }
+        let Ok(rel) = entrada.path().strip_prefix(&sandbox.root) else { continue };
+        let rel_txt = rel.to_string_lossy().to_string();
+        if rel_txt.is_empty() {
+            continue;
+        }
+        if padrao.matches_with(&rel_txt, opcoes) {
+            out.push(rel_txt);
+        }
+    }
+    // Walker devolve fora de ordem; resultado de glob precisa ser estavel.
+    out.sort();
+    Ok(out.into_iter().map(rhai::Dynamic::from).collect())
 }
 
 /// Tally de chamadas de primitiva, incrementado nos próprios pontos de

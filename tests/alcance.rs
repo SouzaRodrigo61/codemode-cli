@@ -318,3 +318,60 @@ try {{
         .stdout(predicates::str::contains("antes=de dentro"))
         .stdout(predicates::str::contains("bloqueado"));
 }
+
+#[test]
+fn glob_respeita_gitignore_mas_obedece_pedido_explicito() {
+    // Mesma regra do grep (#28): o .gitignore governa onde a gente entra
+    // sozinho, nunca o que foi pedido pelo nome.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(".gitignore"), "build/\n").unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::create_dir_all(dir.path().join("build/fundo")).unwrap();
+    fs::write(dir.path().join("src/a.rs"), "// codigo\n").unwrap();
+    fs::write(dir.path().join("src/b.rs"), "// codigo\n").unwrap();
+    fs::write(dir.path().join("build/gerado.rs"), "// artefato\n").unwrap();
+    fs::write(dir.path().join("build/fundo/outro.rs"), "// artefato\n").unwrap();
+    std::process::Command::new("git").arg("init").arg("-q").current_dir(dir.path()).status().unwrap();
+
+    let s = escreve(
+        dir.path(),
+        r#"
+let tudo = glob("**/*.rs");
+print("normal=" + join(tudo, ","));
+let explicito = glob("build/**/*.rs");
+print("explicito=" + explicito.len());
+"#,
+    );
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        // ordenado e sem os artefatos ignorados
+        .stdout(predicates::str::contains("normal=src/a.rs,src/b.rs"))
+        // pedido pelo nome entra mesmo estando no .gitignore
+        .stdout(predicates::str::contains("explicito=2"));
+}
+
+#[test]
+fn glob_devolve_caminho_que_read_file_aceita_e_ordenado() {
+    let dir = tempfile::tempdir().unwrap();
+    for nome in ["c.txt", "a.txt", "b.txt"] {
+        fs::write(dir.path().join(nome), "x\n").unwrap();
+    }
+    let s = escreve(
+        dir.path(),
+        r#"
+let g = glob("*.txt");
+print("ordem=" + join(g, ","));
+let total = 0;
+for f in g { total += read_file(f).len(); }
+print("lidos=" + total);
+"#,
+    );
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("ordem=a.txt,b.txt,c.txt"))
+        .stdout(predicates::str::contains("lidos=6"));
+}

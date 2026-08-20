@@ -1,0 +1,11 @@
+# Pinado de proposito. O clippy do runner (stable) tem lints que uma stable
+# alguns meses mais velha nao aplica: `question_mark` quebrou dois PRs
+# seguidos (#26 e #49) com o codigo passando limpo na maquina local, onde a
+# stable instalada era 1.95 contra a 1.97 do CI.
+#
+# Com o pin, `cargo clippy` local e o do CI sao o MESMO clippy. Subir de
+# versao vira um PR deliberado -- que e onde se descobre lint nova, em vez de
+# no meio de outro trabalho.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]

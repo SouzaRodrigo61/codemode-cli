@@ -9,8 +9,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Sem `@stable`: o rust-toolchain.toml do repo e quem manda, pra o
+      # clippy do CI ser o mesmo da maquina de quem escreve (#54).
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
@@ -30,7 +33,9 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
       - name: casos de performance
