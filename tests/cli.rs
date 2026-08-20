@@ -834,3 +834,101 @@ print("certo=" + replaced(atual, "VELHO", "NOVO"));
         .success()
         .stdout(predicates::str::contains("certo=NOVO conteudo aqui"));
 }
+
+// ---------------------------------------------------------------------------
+// #61 -- faixa de linhas no read_file. A primitiva mais usada (20.729 chamadas
+// na telemetria do #58) lia sempre o arquivo inteiro: quem queria 20 linhas
+// pagava o arquivo todo, e o que fosse impresso virava token de contexto.
+// ---------------------------------------------------------------------------
+
+fn arquivo_numerado(dir: &std::path::Path, nome: &str, linhas: usize) -> std::path::PathBuf {
+    let conteudo: String = (1..=linhas).map(|n| format!("linha{n}\n")).collect();
+    let p = dir.join(nome);
+    fs::write(&p, conteudo).unwrap();
+    p
+}
+
+#[test]
+fn read_file_com_faixa_devolve_so_o_trecho_pedido() {
+    let dir = tempfile::tempdir().unwrap();
+    arquivo_numerado(dir.path(), "f.txt", 10);
+    let script = dir.path().join("s.rhai");
+    // Faixa é 1-based e inclusiva nas duas pontas -- como editor e como
+    // `sed -n 'i,jp'`, não como slice de Rust.
+    fs::write(
+        &script,
+        r#"
+print("faixa=" + replaced(read_file("f.txt", #{lines: "3-5"}), "\n", "|"));
+print("aberta=" + replaced(read_file("f.txt", #{lines: "9-"}), "\n", "|"));
+print("uma=" + replaced(read_file("f.txt", #{lines: "7"}), "\n", "|"));
+print("inteiro=" + lines(read_file("f.txt")).len());
+"#,
+    )
+    .unwrap();
+
+    cmd()
+        .args(["run", script.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("faixa=linha3|linha4|linha5|"))
+        .stdout(predicates::str::contains("aberta=linha9|linha10|"))
+        .stdout(predicates::str::contains("uma=linha7|"))
+        // Sem o segundo argumento nada muda: continua o arquivo inteiro.
+        .stdout(predicates::str::contains("inteiro=10"));
+}
+
+#[test]
+fn read_file_com_faixa_alem_do_fim_devolve_o_que_existe() {
+    // Pedir 5-999 num arquivo de 6 linhas não é erro: é o mesmo contrato do
+    // `sed -n '5,999p'`. Erro seria só a faixa impossível de satisfazer.
+    let dir = tempfile::tempdir().unwrap();
+    arquivo_numerado(dir.path(), "f.txt", 6);
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"print("n=" + lines(read_file("f.txt", #{lines: "5-999"})).len());"#)
+        .unwrap();
+
+    cmd()
+        .args(["run", script.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("n=2"));
+}
+
+#[test]
+fn read_file_recusa_faixa_invalida_com_mensagem_util() {
+    let dir = tempfile::tempdir().unwrap();
+    arquivo_numerado(dir.path(), "f.txt", 4);
+
+    // Cada caso traz o que a pessoa escreveu de volta na mensagem -- erro que
+    // não mostra o valor recebido faz quem escreveu o script adivinhar.
+    for (spec, esperado) in [
+        ("0-2", "1-based"),
+        ("9-2", "ends before it starts"),
+        ("abc", "is not a range"),
+    ] {
+        let script = dir.path().join("s.rhai");
+        fs::write(&script, format!(r#"read_file("f.txt", #{{lines: "{spec}"}});"#)).unwrap();
+        cmd()
+            .args(["run", script.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(esperado));
+    }
+}
+
+#[test]
+fn read_file_recusa_chave_desconhecida_em_vez_de_ignorar() {
+    // Ignorar `#{linahs: ...}` em silêncio devolveria o arquivo inteiro e o
+    // script seguiria achando que recortou -- resultado errado sem sinal, a
+    // mesma falha que o #60 corrigiu no glob.
+    let dir = tempfile::tempdir().unwrap();
+    arquivo_numerado(dir.path(), "f.txt", 4);
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"read_file("f.txt", #{linahs: "1-2"});"#).unwrap();
+
+    cmd()
+        .args(["run", script.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no other key is supported"));
+}
