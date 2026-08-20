@@ -123,7 +123,7 @@ pub const STDLIB: &[&str] =
 pub const PRIMITIVES: &[&str] = &[
     "read_file", "write_file", "write_file_force", "append_file", "edit_file", "run_shell",
     "run_shell_full", "run_shell_confirmed", "grep", "glob", "http_get", "replace_all_in_glob",
-    "parallel_shell", "path_exists",
+    "parallel_shell", "path_exists", "read_files",
 ];
 
 /// Sugere o registrado mais parecido (distância de edição curta ou prefixo
@@ -441,5 +441,42 @@ mod testes {
             .filter(|n| !registrados.contains(*n))
             .collect();
         assert!(ausentes.is_empty(), "nomes na lista rápida que o engine NÃO registra: {ausentes:?}");
+    }
+
+    /// O sentido inverso do teste acima, que faltava -- e por onde o
+    /// `read_files` (#63) passou: ficou registrado no engine e FORA da lista,
+    /// entao `codemode check` reportava "0 primitiva(s) referenciada(s)" para
+    /// um script que so usava ele, e a contagem que decide desperdicio/
+    /// `--strict` ignorava a chamada.
+    ///
+    /// Comparar contra um engine SEM o nosso `register` isola exatamente o
+    /// vocabulario que nos adicionamos, sem arrastar a stdlib do Rhai.
+    #[test]
+    fn tudo_que_o_nosso_register_adiciona_esta_em_alguma_lista() {
+        fn nomes(engine: &rhai::Engine) -> std::collections::BTreeSet<String> {
+            engine
+                .gen_fn_signatures(true)
+                .into_iter()
+                .map(|s| s.split('(').next().unwrap_or_default().trim().to_string())
+                .collect()
+        }
+
+        let base = nomes(&crate::primitives::nova_engine());
+        let mut engine = crate::primitives::nova_engine();
+        let sandbox = crate::sandbox::Sandbox::new(std::path::Path::new(".")).unwrap();
+        crate::primitives::register(&mut engine, sandbox, Vec::new(), crate::primitives::new_counter());
+        let depois = nomes(&engine);
+
+        let conhecidos: std::collections::BTreeSet<&str> =
+            STDLIB.iter().chain(PRIMITIVES.iter()).copied().collect();
+        let fora: Vec<&String> = depois
+            .difference(&base)
+            .filter(|n| !conhecidos.contains(n.as_str()))
+            .collect();
+        assert!(
+            fora.is_empty(),
+            "o engine registra nomes que o pré-voo não conhece -- some com a contagem \
+             de primitivas e com o `check`: {fora:?}"
+        );
     }
 }
