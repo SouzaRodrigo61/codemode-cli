@@ -272,6 +272,27 @@ walker descended into everything and read every file as UTF-8 before finding
 out it was a binary — it was four times slower than shelling out to `grep`,
 which is exactly what the primitive existed to avoid.
 
+## Trivial commands never spawn a process
+
+A census of 401 `run_shell` commands written by real scripts found that
+**55% of them are trivial** — `cat`, `ls`, `grep`, `rm`, `cp`, `echo`,
+`test`, `mkdir`, `touch`, `head`, `basename`, `dirname`, `true` — and each
+one was paying 1.5–8.5 ms of process spawn. Those exact forms now run
+in-process, at ~0.02 ms.
+
+Measured: 50 trivial commands in a loop, **373 ms → 7.5 ms**.
+
+The rule that makes this safe is *exact forms only*. An unrecognized flag,
+a glob, a shell metachar, or a different arity falls through to the same
+spawn as before — diverging from the real shell would be worse than being
+slow, and every covered form has a test comparing its output byte-for-byte
+against the real binary.
+
+The pre-flight also names the primitive when a script shells out to
+something that already exists natively (`cat` → `read_file`, `find` →
+`glob`, `sed -i` → `replace_all_in_glob`), since a primitive returns typed
+data instead of text to re-parse.
+
 ## Known traps
 
 Paid for already — don't rediscover them:
