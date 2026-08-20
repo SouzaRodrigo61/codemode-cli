@@ -242,6 +242,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "glob",
+ "ignore",
  "predicates",
  "rhai",
  "rtk",

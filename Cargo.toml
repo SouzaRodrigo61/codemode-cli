@@ -19,6 +19,9 @@ shell-words = "1"
 # Ja presentes no lock via rtk -- adicionar como dep direta nao baixa nada novo.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Ja no grafo via rtk: o walker do ripgrep, que respeita .gitignore -- e o que
+# tira o grep nativo de segundos para dezenas de ms num repo com target/ (#28).
+ignore = "0.4"
 # In-process filter calls instead of spawning the rtk binary -- see
 # src/primitives.rs's run_shell_impl for why (measured: spawning rtk costs
 # 3.5-13ms depending on path, more than some filtered commands cost raw).
