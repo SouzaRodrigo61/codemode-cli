@@ -6,7 +6,11 @@ fn maestri_available() -> bool {
 }
 
 fn cmd() -> Command {
-    Command::cargo_bin("codemode").unwrap()
+    let mut c = Command::cargo_bin("codemode").unwrap();
+    // Teste nunca escreve no histórico real: é ele que `codemode gain`
+    // reporta, e execução de teste não é uso.
+    c.env("CODEMODE_NO_TELEMETRY", "1");
+    c
 }
 
 /// These hit the real `maestri` binary (workspace-scoped notes, no

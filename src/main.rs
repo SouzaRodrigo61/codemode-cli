@@ -1,8 +1,10 @@
 mod bench;
 mod denylist;
+mod gain;
 mod maestri;
 mod primitives;
 mod sandbox;
+mod telemetry;
 
 use clap::{Parser, Subcommand};
 use rhai::Engine;
@@ -49,6 +51,19 @@ enum Commands {
         #[arg(long = "arg")]
         script_args: Vec<String>,
     },
+    /// Report what the recorded runs actually saved: tool-calls avoided,
+    /// error rate, and where the waste is. Reads `~/.codemode/runs.jsonl`.
+    Gain {
+        /// List the most recent runs before the summary.
+        #[arg(long)]
+        history: bool,
+        /// Emit the aggregate as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// How many runs `--history` lists.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Time a .rhai script's real wall-clock cost, natively -- no Python/shell
     /// timing harness, no interpreter-spawn overhead skewing the result.
     Bench {
@@ -87,6 +102,15 @@ fn main() {
                 }
             }
         }
+        Commands::Gain { history, json, limit } => {
+            match gain::run(gain::GainArgs { history, json, limit }) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("codemode: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::Bench { script, workdir, compare, reset_cmd, n } => {
             let args = bench::BenchArgs { script, workdir, compare, reset_cmd, n };
             match bench::run(args) {
@@ -100,16 +124,16 @@ fn main() {
     }
 }
 
-fn read_script(script: &str, workdir: &PathBuf) -> Result<String, String> {
+fn read_script(script: &str, workdir: &PathBuf) -> Result<(String, &'static str), String> {
     if script == "-" {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
             .map_err(|e| format!("failed to read script from stdin: {e}"))?;
-        return Ok(buf);
+        return Ok((buf, "stdin"));
     }
     match std::fs::read_to_string(script) {
-        Ok(s) => Ok(s),
+        Ok(s) => Ok((s, "file")),
         // Repo script library convention (issue #9): a bare name that
         // doesn't resolve as given also gets looked up in the workdir's
         // `.codemode/` directory, so a versioned library of reusable
@@ -122,7 +146,7 @@ fn read_script(script: &str, workdir: &PathBuf) -> Result<String, String> {
             if is_bare_name {
                 let lib_path = workdir.join(".codemode").join(script);
                 if let Ok(s) = std::fs::read_to_string(&lib_path) {
-                    return Ok(s);
+                    return Ok((s, "lib"));
                 }
             }
             Err(format!(
@@ -134,7 +158,18 @@ fn read_script(script: &str, workdir: &PathBuf) -> Result<String, String> {
 }
 
 fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize, verbose: bool, allow_hosts: Vec<String>, script_args: Vec<String>) -> Result<i32, String> {
-    let source = read_script(script_arg, workdir)?;
+    let started = Instant::now();
+    let (source, origem) = read_script(script_arg, workdir)?;
+    let counter = primitives::new_counter();
+    let meta = RunMeta {
+        script: telemetry::hash(&source),
+        source: origem.to_string(),
+        name: if origem == "stdin" { None } else { Some(script_arg.to_string()) },
+        workdir: std::fs::canonicalize(workdir)
+            .unwrap_or_else(|_| workdir.clone())
+            .display()
+            .to_string(),
+    };
 
     // Fires before the script runs, and regardless of whether it succeeds:
     // the write-wipe incident this guards against never errored.
@@ -144,7 +179,7 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
     let sandbox = Sandbox::new(workdir)?;
 
     let mut engine = Engine::new();
-    primitives::register(&mut engine, sandbox, allow_hosts);
+    primitives::register(&mut engine, sandbox, allow_hosts, counter.clone());
     maestri::register(&mut engine);
     let sink = primitives::register_output_capture(&mut engine, max_output);
 
@@ -208,9 +243,11 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
                 if let Some(msg) = token.strip_prefix("denylist:") {
                     eprintln!("codemode: {msg}");
                     print_sink(&sink);
+                    record_run(&meta, &counter, &sink, 1, started);
                     return Ok(1);
                 }
                 eprintln!("codemode: script exceeded {timeout_secs}s timeout, aborted");
+                record_run(&meta, &counter, &sink, 124, started);
                 return Ok(124);
             }
             eprintln!("codemode: script error: {e}");
@@ -218,6 +255,7 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
                 eprintln!("codemode: dica: {hint}");
             }
             print_sink(&sink);
+            record_run(&meta, &counter, &sink, 1, started);
             return Ok(1);
         }
         Err(_) => {
@@ -225,13 +263,53 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
             // The eval thread may be stuck in a blocking native call; we
             // cannot safely join/kill it, so exit the whole process.
             eprintln!("codemode: script exceeded {timeout_secs}s timeout (watchdog), aborting process");
+            record_run(&meta, &counter, &sink, 124, started);
             std::process::exit(124);
         }
     }
 
     let _ = handle.join();
     print_sink(&sink);
+    record_run(&meta, &counter, &sink, 0, started);
     Ok(0)
+}
+
+/// O que a telemetria sabe da execução antes dela terminar.
+struct RunMeta {
+    script: String,
+    source: String,
+    name: Option<String>,
+    workdir: String,
+}
+
+/// Grava a linha de telemetria. Chamada em TODA saída de `run` -- inclusive
+/// nas de falha, porque a taxa de erro é justamente um dos números que o
+/// relatório existe para expor (issue #11/#12).
+fn record_run(
+    meta: &RunMeta,
+    counter: &primitives::Counter,
+    sink: &primitives::SharedSink,
+    exit_code: i32,
+    started: Instant,
+) {
+    let prims: std::collections::BTreeMap<String, u64> =
+        counter.lock().map(|m| m.clone()).unwrap_or_default();
+    let prim_total = prims.values().sum();
+    // Bytes que de fato chegam ao contexto do chamador -- o buffer impresso,
+    // não o spill em disco, que existe justamente para NÃO ser lido.
+    let out_bytes = sink.lock().map(|s| s.buf.len() as u64).unwrap_or(0);
+    telemetry::record(&telemetry::Entry {
+        ts: telemetry::now_secs(),
+        script: meta.script.clone(),
+        source: meta.source.clone(),
+        name: meta.name.clone(),
+        prims,
+        prim_total,
+        out_bytes,
+        exit_code,
+        ms: started.elapsed().as_millis() as u64,
+        workdir: meta.workdir.clone(),
+    });
 }
 
 /// Best-effort, informational only: checks a few plausible env var names

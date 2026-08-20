@@ -245,6 +245,8 @@ dependencies = [
  "predicates",
  "rhai",
  "rtk",
+ "serde",
+ "serde_json",
  "shell-words",
  "tempfile",
 ]

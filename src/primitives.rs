@@ -782,79 +782,122 @@ fn glob_impl(sandbox: &Sandbox, pattern: &str) -> Result<Array, Box<EvalAltResul
     Ok(out)
 }
 
-pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>) {
+/// Tally de chamadas de primitiva, incrementado nos próprios pontos de
+/// registro: o que a telemetria reporta é o que o engine de fato despachou,
+/// não um regex adivinhando sobre o fonte (issue #11).
+pub type Counter = std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>;
+
+pub fn new_counter() -> Counter {
+    std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+fn bump(c: &Counter, nome: &str) {
+    if let Ok(mut m) = c.lock() {
+        *m.entry(nome.to_string()).or_insert(0) += 1;
+    }
+}
+
+pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>, counter: Counter) {
     {
         let allow = allow_hosts;
+        let ct = counter.clone();
         engine.register_fn("http_get", move |url: &str| -> Result<Map, Box<EvalAltResult>> {
+            bump(&ct, "http_get");
             http_get_impl(&allow, url)
         });
     }
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("read_file", move |path: &str| -> Result<String, Box<EvalAltResult>> {
+        bump(&ct, "read_file");
         read_file_impl(&sb, path)
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("write_file", move |path: &str, content: &str| -> Result<(), Box<EvalAltResult>> {
+        bump(&ct, "write_file");
         write_file_guarded(&sb, path, content)
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("write_file_force", move |path: &str, content: &str| -> Result<(), Box<EvalAltResult>> {
+        bump(&ct, "write_file_force");
         write_file_impl(&sb, path, content)
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("append_file", move |path: &str, content: &str| -> Result<(), Box<EvalAltResult>> {
+        bump(&ct, "append_file");
         append_file_impl(&sb, path, content)
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn(
         "edit_file",
         move |path: &str, old: &str, new: &str| -> Result<(), Box<EvalAltResult>> {
+        bump(&ct, "edit_file");
             edit_file_impl(&sb, path, old, new)
         },
     );
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("run_shell", move |cmd: &str| -> Result<String, Box<EvalAltResult>> {
+        bump(&ct, "run_shell");
         run_shell_impl(&sb, cmd, false)
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("run_shell", move |cmd: &str, opts: Map| -> Result<String, Box<EvalAltResult>> {
+        bump(&ct, "run_shell");
         run_shell_impl(&sb, cmd, confirm_from_map(&opts))
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("run_shell_full", move |cmd: &str| -> Result<Map, Box<EvalAltResult>> {
+        bump(&ct, "run_shell_full");
         run_shell_full_impl(&sb, cmd, false)
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("run_shell_full", move |cmd: &str, opts: Map| -> Result<Map, Box<EvalAltResult>> {
+        bump(&ct, "run_shell_full");
         run_shell_full_impl(&sb, cmd, confirm_from_map(&opts))
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("run_shell_confirmed", move |cmd: &str| -> Result<String, Box<EvalAltResult>> {
+        bump(&ct, "run_shell_confirmed");
         run_shell_impl(&sb, cmd, true)
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("grep", move |pattern: &str| -> Result<String, Box<EvalAltResult>> {
+        bump(&ct, "grep");
         grep_impl(&sb, pattern, ".")
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("grep", move |pattern: &str, path: &str| -> Result<String, Box<EvalAltResult>> {
+        bump(&ct, "grep");
         grep_impl(&sb, pattern, path)
     });
 
     let sb = sandbox.clone();
+    let ct = counter.clone();
     engine.register_fn("glob", move |pattern: &str| -> Result<Array, Box<EvalAltResult>> {
+        bump(&ct, "glob");
         glob_impl(&sb, pattern)
     });
 
