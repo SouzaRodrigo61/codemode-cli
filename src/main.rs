@@ -545,11 +545,25 @@ fn primitiva_unica_como_shell(source: &str) -> Option<String> {
         }
         match c {
             '\\' => escapado = true,
-            '"' => return Some(saida),
+            '"' => return Some(trunca_sugestao(saida)),
             _ => saida.push(c),
         }
     }
     None
+}
+
+/// A sugestão vai pro stderr, e stderr também é contexto. Um `run_shell` com
+/// comando de 200 caracteres despejava tudo -- trocava o problema que o #80
+/// resolveu por um do tipo que o #62 existe pra evitar. Mesmo limite do
+/// watchdog (#79), pelo mesmo motivo: serve pra identificar, não pra colar de
+/// olhos fechados.
+fn trunca_sugestao(cmd: String) -> String {
+    const LIMITE: usize = 70;
+    if cmd.chars().count() <= LIMITE {
+        return cmd;
+    }
+    let corte: String = cmd.chars().take(LIMITE - 3).collect();
+    format!("{corte}...")
 }
 
 /// `--json` (#2): a saída vira dado, não prosa pro modelo reparsear.

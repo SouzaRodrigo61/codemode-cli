@@ -334,3 +334,26 @@ fn sugestao_de_primitiva_unica_segue_funcionando_no_comando_simples() {
         .success()
         .stderr(predicates::str::contains("o equivalente direto é: echo ola"));
 }
+
+#[test]
+fn sugestao_de_primitiva_unica_trunca_comando_longo() {
+    // stderr tambem e contexto: depois do #80 o aviso passou a imprimir o
+    // comando inteiro, e um `run_shell` de 200 caracteres despejava tudo --
+    // trocava o problema que o #80 resolveu por um do tipo que o #62 evita.
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    let enchimento = "a".repeat(200);
+    fs::write(&s, format!("print(run_shell(\"echo {enchimento}\"));\n")).unwrap();
+
+    let out = cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let erro = String::from_utf8_lossy(&out.stderr);
+    let linha = erro
+        .lines()
+        .find(|l| l.contains("equivalente direto"))
+        .unwrap_or_else(|| panic!("sem linha de sugestao: {erro}"));
+    assert!(linha.contains("..."), "truncou: {linha}");
+    assert!(!linha.contains(&"a".repeat(100)), "nao despeja o comando inteiro: {linha}");
+}
