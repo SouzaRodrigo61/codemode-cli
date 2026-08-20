@@ -298,6 +298,30 @@ sessions (issue #9). Only bare names fall back; an explicit path that
 doesn't exist fails loudly, never silently swapped for a library file.
 Check `.codemode/` before writing a new script.
 
+## The repo's script library, and when NOT to use codemode
+
+```
+codemode list                    # what this repo already has, and how often each ran
+codemode save verify --desc "…"  # promote the last script you ran into .codemode/
+codemode run verify.rhai         # run it by bare name
+codemode idioms                  # the Rhai traps that cost the most wasted runs
+```
+
+`save` exists because the measured failure mode is agents rewriting the same
+script every session: of 200 audited runs, only 7% came from a library.
+`list` exists so the library is discoverable at all — an agent that cannot
+see it will rewrite it.
+
+A script that collapses **fewer than two primitives** now warns on stderr,
+and `--strict` refuses to run it at all: wrapping a single call in Rhai costs
+more than the Bash call it replaces (17% of audited runs were exactly this).
+Scripts with a loop are exempt — one call in the source can be N at runtime.
+
+`codemode run x.rhai --json` returns `{output, exit_code, prims, prim_total,
+calls_avoided, ms}` instead of raw text, so the next step can branch on data.
+`replace_all_in_glob(pattern, old, new)` does the bulk edit that was being
+hand-rolled as a loop of `edit_file`, and returns the paths it touched.
+
 ## Sandbox / security model
 
 This is a prototype with real, tested guardrails — not a full container

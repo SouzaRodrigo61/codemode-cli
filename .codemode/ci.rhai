@@ -1,4 +1,4 @@
-// Gate local do próprio codemode-cli num tool-call.
+// desc: gate local do próprio codemode-cli (fmt + clippy + test) num tool-call.
 // Uso: codemode run ci.rhai
 print("== cargo test ==");
 let r = run_shell_full("cargo test --release");

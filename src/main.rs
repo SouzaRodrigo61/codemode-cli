@@ -1,5 +1,6 @@
 mod bench;
 mod denylist;
+mod biblioteca;
 mod gain;
 mod preflight;
 mod maestri;
@@ -56,6 +57,15 @@ enum Commands {
         /// Print a call log (each primitive invocation) to stderr for debugging.
         #[arg(long)]
         verbose: bool,
+        /// Refuse to run a script that collapses fewer than two primitives:
+        /// wrapping a single call in Rhai costs more than the plain Bash
+        /// call it replaces.
+        #[arg(long)]
+        strict: bool,
+        /// Emit one JSON object (output, exit code, primitive counts,
+        /// duration) instead of the raw script output.
+        #[arg(long)]
+        json: bool,
         /// Announce every mutating primitive instead of performing it: no
         /// write, no edit, no shell command. Reads still run.
         #[arg(long = "dry-run")]
@@ -72,6 +82,31 @@ enum Commands {
         #[arg(long = "arg")]
         script_args: Vec<String>,
     },
+    /// Copy the last script you ran (or --from) into `<workdir>/.codemode/`
+    /// so it stops being scratchpad litter and starts being a repo asset.
+    Save {
+        /// Name in the library; `.rhai` is appended if missing.
+        nome: String,
+        #[arg(long, default_value = ".")]
+        workdir: PathBuf,
+        /// Source to save: a path, or "-" for stdin. Defaults to the last
+        /// script this machine ran.
+        #[arg(long)]
+        from: Option<String>,
+        /// One-line description, written as the `// desc:` header.
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// List this repo's `.codemode/` library: description, whether it takes
+    /// `--arg`, and how many times each script has actually run.
+    List {
+        #[arg(long, default_value = ".")]
+        workdir: PathBuf,
+    },
+    /// Print the Rhai idioms and traps that cost the most wasted runs.
+    Idioms,
     /// Validate a script without running it: compile, resolve every called
     /// symbol against what is actually registered, and lint. Exits non-zero
     /// on the first problem -- meant for CI over a repo's `.codemode/`.
@@ -123,6 +158,23 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Save { nome, workdir, from, desc, force } => {
+            match biblioteca::save(biblioteca::SaveArgs { nome, workdir, from, desc, force }) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("codemode: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::List { workdir } => match biblioteca::list(&workdir) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("codemode: {e}");
+                std::process::exit(1);
+            }
+        },
+        Commands::Idioms => std::process::exit(biblioteca::idioms()),
         Commands::Check { script, workdir } => match check(&script, &workdir) {
             Ok(code) => std::process::exit(code),
             Err(e) => {
@@ -139,11 +191,13 @@ fn main() {
             extra_root,
             max_output,
             verbose,
+            strict,
+            json,
             dry_run,
             allow_host,
             script_args,
         } => {
-            let opts = RunOpts { timeout, cmd_timeout, vm_idle, extra_root, max_output, verbose, dry_run, allow_hosts: allow_host };
+            let opts = RunOpts { timeout, cmd_timeout, vm_idle, extra_root, max_output, verbose, strict, json, dry_run, allow_hosts: allow_host };
             match run(&script, &workdir, opts, script_args) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
@@ -216,12 +270,14 @@ struct RunOpts {
     extra_root: Vec<PathBuf>,
     max_output: usize,
     verbose: bool,
+    strict: bool,
+    json: bool,
     dry_run: bool,
     allow_hosts: Vec<String>,
 }
 
 fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>) -> Result<i32, String> {
-    let RunOpts { timeout: timeout_secs, cmd_timeout, vm_idle, extra_root, max_output, verbose, dry_run, allow_hosts } = opts;
+    let RunOpts { timeout: timeout_secs, cmd_timeout, vm_idle, extra_root, max_output, verbose, strict, json, dry_run, allow_hosts } = opts;
     let started = Instant::now();
     let (source, origem) = read_script(script_arg, workdir)?;
     let counter = primitives::new_counter();
@@ -261,6 +317,26 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
     for w in &relatorio.warnings {
         eprintln!("codemode: dica: {w}");
     }
+    // Guarda de trivialidade (#21): 34 das 200 execuções auditadas
+    // embrulharam UMA primitiva em Rhai -- custo líquido negativo. Script
+    // com laço fica de fora: uma chamada no fonte pode ser N em execução.
+    if relatorio.prim_calls < 2 && !relatorio.has_loop {
+        let equivalente = primitiva_unica_como_shell(&source)
+            .map(|c| format!(" -- o equivalente direto é: {c}"))
+            .unwrap_or_default();
+        eprintln!(
+            "codemode: aviso: {} primitiva(s) neste script: Bash direto sai mais barato{}",
+            relatorio.prim_calls, equivalente
+        );
+        if strict {
+            eprintln!("codemode: --strict: recusado sem executar");
+            record_run(&meta, &counter, &sink, 2, started);
+            return Ok(2);
+        }
+    }
+    // O `save` precisa saber qual foi o último script; o log de telemetria
+    // guarda só metadado, de propósito.
+    guarda_ultimo_script(&source);
     if dry_run {
         eprintln!("codemode: --dry-run: nada será escrito nem executado");
     }
@@ -371,7 +447,11 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
             for hint in preflight::foreign_idiom_hints(&source) {
                 eprintln!("codemode: dica: {hint}");
             }
-            print_sink(&sink);
+            if json {
+                imprime_json(&counter, &sink, 1, started);
+            } else {
+                print_sink(&sink);
+            }
             record_run(&meta, &counter, &sink, 1, started);
             return Ok(1);
         }
@@ -386,9 +466,50 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
     }
 
     let _ = handle.join();
-    print_sink(&sink);
+    if json {
+        imprime_json(&counter, &sink, 0, started);
+    } else {
+        print_sink(&sink);
+    }
     record_run(&meta, &counter, &sink, 0, started);
     Ok(0)
+}
+
+/// Se o script tem uma única primitiva e ela é um `run_shell` com literal,
+/// o aviso do #21 diz qual comando rodar direto.
+fn primitiva_unica_como_shell(source: &str) -> Option<String> {
+    let at = source.find("run_shell(\"")?;
+    let resto = &source[at + "run_shell(\"".len()..];
+    let fim = resto.find('"')?;
+    Some(resto[..fim].to_string())
+}
+
+/// `--json` (#2): a saída vira dado, não prosa pro modelo reparsear.
+fn imprime_json(counter: &primitives::Counter, sink: &primitives::SharedSink, exit_code: i32, started: Instant) {
+    let prims: std::collections::BTreeMap<String, u64> = counter.lock().map(|m| m.clone()).unwrap_or_default();
+    let prim_total: u64 = prims.values().sum();
+    let (saida, truncado) = sink.lock().map(|s| (s.buf.clone(), s.truncated)).unwrap_or_default();
+    let corpo = serde_json::json!({
+        "exit_code": exit_code,
+        "output": saida,
+        "truncated": truncado,
+        "prims": prims,
+        "prim_total": prim_total,
+        "calls_avoided": prim_total.saturating_sub(1),
+        "ms": started.elapsed().as_millis() as u64,
+    });
+    println!("{corpo}");
+}
+
+fn guarda_ultimo_script(source: &str) {
+    if std::env::var("CODEMODE_NO_TELEMETRY").is_ok() {
+        return;
+    }
+    if let Some(home) = telemetry::home() {
+        if std::fs::create_dir_all(&home).is_ok() {
+            let _ = std::fs::write(home.join("last.rhai"), source);
+        }
+    }
 }
 
 /// `codemode check`: pré-voo sem execução. Existe para o CI de um repo
