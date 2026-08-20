@@ -837,7 +837,18 @@ pub fn new_counter() -> Counter {
     std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
+/// Total de primitivas despachadas, separado do mapa por nome porque a
+/// guarda de ociosidade (#18) le este numero a cada operacao de VM: pegar o
+/// Mutex e somar o BTreeMap ali custava 27% do tempo de um script
+/// computacional (#39).
+static TOTAL_CHAMADAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn total_chamadas() -> u64 {
+    TOTAL_CHAMADAS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn bump(c: &Counter, nome: &str) {
+    TOTAL_CHAMADAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut m) = c.lock() {
         *m.entry(nome.to_string()).or_insert(0) += 1;
     }
@@ -1098,6 +1109,34 @@ fn replace_all_in_glob_impl(
         tocados.push(caminho.into());
     }
     Ok(tocados)
+}
+
+/// `Engine::new()` registra o StandardPackage inteiro, e isso custava
+/// 0,65-0,89ms em TODA execução -- mais do que muitos scripts inteiros.
+/// Aqui entram só os pacotes que um script de codemode usa; ficam de fora o
+/// de blob (binário) e o de depuração. O teste
+/// `vocabulario_rhai_continua_completo` é o contrato desta escolha (#41).
+pub fn nova_engine() -> Engine {
+    use rhai::packages::Package;
+    let mut e = Engine::new_raw();
+    rhai::packages::LanguageCorePackage::new().register_into_engine(&mut e);
+    rhai::packages::ArithmeticPackage::new().register_into_engine(&mut e);
+    rhai::packages::LogicPackage::new().register_into_engine(&mut e);
+    rhai::packages::BasicStringPackage::new().register_into_engine(&mut e);
+    rhai::packages::MoreStringPackage::new().register_into_engine(&mut e);
+    rhai::packages::BasicIteratorPackage::new().register_into_engine(&mut e);
+    rhai::packages::BasicFnPackage::new().register_into_engine(&mut e);
+    rhai::packages::BasicArrayPackage::new().register_into_engine(&mut e);
+    rhai::packages::BasicMapPackage::new().register_into_engine(&mut e);
+    rhai::packages::BasicMathPackage::new().register_into_engine(&mut e);
+    rhai::packages::BasicTimePackage::new().register_into_engine(&mut e);
+    // `Engine::new()` faz isto por baixo; `new_raw()` não.
+    e.on_print(|texto| println!("{texto}"));
+    e.on_debug(|texto, origem, pos| match origem {
+        Some(o) => eprintln!("{o} @ {pos:?} | {texto}"),
+        None => eprintln!("{pos:?} | {texto}"),
+    });
+    e
 }
 
 pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>, counter: Counter) {

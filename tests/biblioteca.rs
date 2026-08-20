@@ -21,10 +21,12 @@ fn escreve(dir: &Path, src: &str) -> std::path::PathBuf {
 fn save_promove_o_ultimo_script_e_list_mostra_o_catalogo() {
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let s = escreve(dir.path(), "run_shell(\"true\");\nrun_shell(\"true\");\nprint(\"rodei\");\n");
 
+    // Script de stdin: o fonte é guardado, e é este o caso que o `save` sem
+    // --from existe para atender (script inline virando ativo do repo).
     cmd(home.path())
-        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .args(["run", "-", "--workdir", dir.path().to_str().unwrap()])
+        .write_stdin("run_shell(\"true\");\nrun_shell(\"true\");\nprint(\"rodei\");\n")
         .assert()
         .success();
 
@@ -51,6 +53,32 @@ fn save_promove_o_ultimo_script_e_list_mostra_o_catalogo() {
         .stdout(predicates::str::contains("verifica.rhai"))
         .stdout(predicates::str::contains("roda a verificação"))
         .stdout(predicates::str::contains("1x"));
+}
+
+#[test]
+fn script_de_arquivo_nao_paga_copia_do_fonte() {
+    // Copiar para last.rhai custava 0,28ms em toda execução, e para script
+    // que já está em disco não servia para nada (#42).
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let s = escreve(dir.path(), "run_shell(\"true\"); run_shell(\"true\");");
+    cmd(home.path())
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(!home.path().join("last.rhai").exists(), "script de arquivo não copia o fonte");
+
+    // E o `save` diz o que fazer em vez de falhar sem explicação.
+    cmd(home.path())
+        .args(["save", "x", "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--from"));
+
+    cmd(home.path())
+        .args(["save", "x", "--workdir", dir.path().to_str().unwrap(), "--from", s.to_str().unwrap()])
+        .assert()
+        .success();
 }
 
 #[test]

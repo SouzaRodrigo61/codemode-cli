@@ -9,7 +9,6 @@ mod sandbox;
 mod telemetry;
 
 use clap::{Parser, Subcommand};
-use rhai::Engine;
 use sandbox::Sandbox;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -296,7 +295,7 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
         .with_cmd_timeout(cmd_timeout)
         .with_extra_roots(&extra_root)?;
 
-    let mut engine = Engine::new();
+    let mut engine = primitives::nova_engine();
     primitives::register(&mut engine, sandbox, allow_hosts, counter.clone());
     maestri::register(&mut engine);
     let sink = primitives::register_output_capture(&mut engine, max_output);
@@ -334,9 +333,13 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
             return Ok(2);
         }
     }
-    // O `save` precisa saber qual foi o último script; o log de telemetria
-    // guarda só metadado, de propósito.
-    guarda_ultimo_script(&source);
+    // O `save` precisa do fonte do último script -- mas só quando ele veio
+    // de stdin. Script que veio de arquivo já ESTÁ em disco: gravar uma
+    // cópia custava 0,28ms em toda execução para nada (#42), e o `save
+    // --from <caminho>` cobre esse caso.
+    if origem == "stdin" {
+        guarda_ultimo_script(&source);
+    }
     if dry_run {
         eprintln!("codemode: --dry-run: nada será escrito nem executado");
     }
@@ -363,13 +366,20 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
     let start = Instant::now();
     let deadline = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
     let ociosidade = Duration::from_secs(vm_idle.max(1));
-    let vigia = counter.clone();
     let ultimo_total = std::sync::atomic::AtomicU64::new(0);
     let ultimo_ms = std::sync::atomic::AtomicU64::new(0);
-    engine.on_progress(move |_ops| {
+    engine.on_progress(move |ops| {
         use std::sync::atomic::Ordering;
+        // Amostragem: este hook roda a cada operacao de VM, e duas leituras
+        // de relogio por operacao apareciam em 27% do tempo de um script
+        // computacional (#39). A cada 1024 operacoes ainda e granularidade
+        // de microssegundos -- muito mais fina que os segundos que as duas
+        // guardas medem.
+        if ops % 1024 != 0 {
+            return None;
+        }
         let agora = start.elapsed();
-        let total: u64 = vigia.lock().map(|m| m.values().sum()).unwrap_or(0);
+        let total: u64 = primitives::total_chamadas();
         if total != ultimo_total.load(Ordering::Relaxed) {
             ultimo_total.store(total, Ordering::Relaxed);
             ultimo_ms.store(agora.as_millis() as u64, Ordering::Relaxed);
@@ -517,7 +527,7 @@ fn guarda_ultimo_script(source: &str) {
 fn check(script_arg: &str, workdir: &Path) -> Result<i32, String> {
     let (source, _origem) = read_script(script_arg, workdir)?;
     let sandbox = Sandbox::new(workdir)?;
-    let mut engine = Engine::new();
+    let mut engine = primitives::nova_engine();
     primitives::register(&mut engine, sandbox, Vec::new(), primitives::new_counter());
     maestri::register(&mut engine);
     match preflight::check(&engine, &source) {

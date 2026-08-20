@@ -212,3 +212,93 @@ fn idioma_de_outra_linguagem_vira_dica() {
         .failure()
         .stderr(predicates::str::contains("arrow function"));
 }
+
+#[test]
+fn vocabulario_rhai_continua_completo() {
+    // Contrato do engine enxuto (#41): estes são os pacotes que um script de
+    // codemode de fato usa. Se alguém dropar um pacote a mais, quebra aqui --
+    // não em produção, num script de madrugada.
+    let dir = tempfile::tempdir().unwrap();
+    let s = escreve(
+        dir.path(),
+        r#"
+let a = [3, 1, 2];
+a.push(4); a.sort(); a.reverse();
+let m = #{ x: 1, y: "dois" };
+let txt = "  Oi Mundo ";
+print("arr=" + a.len() + " map=" + m.keys().len());
+print("str=" + trimmed(txt).len() + " up=" + trimmed(txt.to_upper()));
+print("sub=" + "abcdef".sub_string(1, 3) + " idx=" + "abcdef".index_of("cd"));
+print("split=" + "a,b,c".split(",").len());
+print("num=" + parse_int("42") + " f=" + parse_float("1.5"));
+print("mat=" + abs(-3) + " " + max(2, 9) + " " + (2.0).sqrt());
+print("tipo=" + type_of(a) + " " + type_of(m) + " " + type_of(txt));
+let dobro = |x| x * 2;
+print("closure=" + dobro.call(21));
+fn triplo(x) { x * 3 }
+print("fn=" + triplo(14));
+let soma = 0;
+for i in 0..5 { soma += i; }
+print("range=" + soma);
+let filtrado = a.filter(|v| v > 2);
+print("filter=" + filtrado.len());
+print("json=" + to_json(m) + " volta=" + from_json("{\"n\":7}").n);
+print("tempo=" + type_of(timestamp()));
+"#,
+    );
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("arr=4 map=2"))
+        .stdout(predicates::str::contains("str=8 up=OI MUNDO"))
+        .stdout(predicates::str::contains("sub=bcd idx=2"))
+        .stdout(predicates::str::contains("split=3"))
+        .stdout(predicates::str::contains("num=42 f=1.5"))
+        .stdout(predicates::str::contains("mat=3 9 1.4142135623730951"))
+        .stdout(predicates::str::contains("closure=42"))
+        .stdout(predicates::str::contains("fn=42"))
+        .stdout(predicates::str::contains("range=10"))
+        .stdout(predicates::str::contains("filter=2"))
+        .stdout(predicates::str::contains("volta=7"));
+}
+
+#[test]
+fn simbolo_desconhecido_ainda_e_pego_com_o_caminho_rapido() {
+    // O caminho rápido do #40 não pode deixar passar nome inexistente: ele só
+    // decide QUANDO perguntar ao engine, nunca se a resposta vale.
+    let dir = tempfile::tempdir().unwrap();
+    let s = escreve(dir.path(), "let a = [1]; a.push(2); funcao_que_nao_existe(a);");
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("funcao_que_nao_existe"));
+}
+
+#[test]
+fn encadear_em_metodo_mutante_tambem_e_barrado() {
+    // `s.trim().len()` é o mesmo erro de `let t = s.trim()`, em outra forma:
+    // encadeia no retorno unit. Antes só a atribuição era pega.
+    let dir = tempfile::tempdir().unwrap();
+    let s = escreve(dir.path(), "let txt = \"  oi \";\nprint(txt.trim().len());\n");
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("encadear em"))
+        .stderr(predicates::str::contains("trimmed"));
+}
+
+#[test]
+fn igual_dentro_de_string_nao_e_atribuicao() {
+    // `print("str=" + s.trim())` não atribui nada: o `=` está dentro do
+    // literal. Falso positivo achado pelo teste de vocabulário.
+    let dir = tempfile::tempdir().unwrap();
+    let s = escreve(dir.path(), "let txt = \"  oi \";\ntxt.trim();\nprint(\"limpo=\" + txt);\n");
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("limpo=oi"));
+}

@@ -41,7 +41,8 @@ pub fn save(args: SaveArgs) -> Result<i32, String> {
                 .ok_or("HOME indefinido: passe --from")?;
             std::fs::read_to_string(&ultimo).map_err(|e| {
                 format!(
-                    "nenhum script recente em {} ({e}) -- rode um script antes, ou passe --from",
+                    "nenhum script recente em {} ({e}) -- o fonte só é guardado para script \
+                     vindo de stdin; para script que já está em disco, passe --from <caminho>",
                     ultimo.display()
                 )
             })?
