@@ -277,6 +277,59 @@ pub fn mutating_assignments(source: &str) -> Vec<String> {
     out
 }
 
+/// Comando de shell que tem primitiva equivalente (#31). O caminho nativo
+/// (#29) já resolve vários deles em processo, mas a primitiva ainda ganha:
+/// devolve dado tipado em vez de texto pra reparsear, e não depende de o
+/// formato do comando ser o mesmo em macOS e Linux.
+const EQUIVALENTES: &[(&str, &str)] = &[
+    ("cat", "read_file(caminho)"),
+    ("ls", "glob(\"*\")"),
+    ("find", "glob(\"**/*.ext\")"),
+    ("grep", "grep(padrao, caminho) -- respeita .gitignore e é ~200x mais rápido"),
+    ("wc", "lines(read_file(caminho)).len()"),
+    ("sed", "replace_all_in_glob(padrao, velho, novo)"),
+    ("test", "path_exists(caminho)"),
+    ("head", "lines(read_file(caminho))"),
+    ("jq", "from_json(texto)"),
+];
+
+/// Acha `run_shell("comando ...")` no fonte e sugere a primitiva. Olha o
+/// literal, não o AST, porque o comando montado em runtime não dá pra
+/// julgar -- e avisar errado custaria mais do que resolve.
+pub fn shell_com_equivalente(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, linha) in source.lines().enumerate() {
+        if linha.trim_start().starts_with("//") {
+            continue;
+        }
+        for gatilho in ["run_shell(\"", "run_shell_full(\""] {
+            let Some(at) = linha.find(gatilho) else { continue };
+            let resto = &linha[at + gatilho.len()..];
+            let Some(fim) = resto.find('"') else { continue };
+            let comando = &resto[..fim];
+            // Pipe, redirecionamento e encadeamento não têm equivalente
+            // direto: a sugestão seria errada.
+            if comando.contains('|') || comando.contains('>') || comando.contains("&&") {
+                continue;
+            }
+            let Some(primeira) = comando.split_whitespace().next() else { continue };
+            if let Some((_, alternativa)) =
+                EQUIVALENTES.iter().find(|(nome, _)| *nome == primeira)
+            {
+                out.push(format!(
+                    "linha {}: `{}` em run_shell -- use {} (primitiva nativa custa ~0,02ms; \
+                     spawn de processo custa 1,5-8,5ms)",
+                    i + 1,
+                    primeira,
+                    alternativa
+                ));
+            }
+        }
+    }
+    out.truncate(5);
+    out
+}
+
 /// Idiomas de outra linguagem. Continuam avisos: um `=>` dentro de string
 /// não é erro, e falso positivo aqui custaria mais do que resolve.
 pub fn foreign_idiom_hints(source: &str) -> Vec<&'static str> {
@@ -350,10 +403,13 @@ pub fn check(engine: &Engine, source: &str) -> Result<Report, Vec<String>> {
     }
 
     let prim_calls = chamados.iter().filter(|n| PRIMITIVES.contains(&n.as_str())).count();
+    let mut avisos: Vec<String> =
+        foreign_idiom_hints(source).into_iter().map(str::to_string).collect();
+    avisos.extend(shell_com_equivalente(source));
     Ok(Report {
         prim_calls,
         has_loop: has_loop(&ast),
-        warnings: foreign_idiom_hints(source).into_iter().map(str::to_string).collect(),
+        warnings: avisos,
         ast,
     })
 }

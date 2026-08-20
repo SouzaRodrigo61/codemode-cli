@@ -470,6 +470,162 @@ fn grep_shape_rtk_would_passthrough(words: &[String]) -> bool {
     })
 }
 
+
+/// Comando de shell trivial resolvido em processo (#29).
+///
+/// O censo de 401 comandos reais escritos por scripts mostrou que **55% sao
+/// coisas triviais** -- cat, ls, grep, rm, cp, echo, test, mkdir, touch,
+/// head, basename, dirname, true -- e cada uma delas custa 1,5ms a 8,5ms de
+/// spawn contra 0,02ms feita aqui dentro.
+///
+/// Regra de ouro: **so a forma exata**. Qualquer flag fora da lista, glob,
+/// metachar ou aridade diferente devolve None e cai no spawn de sempre --
+/// divergir do shell de verdade seria pior que ser lento. Todo caminho passa
+/// pelo sandbox, igual as primitivas.
+fn try_comando_nativo(words: &[String], sandbox: &Sandbox) -> Option<Result<String, Box<EvalAltResult>>> {
+    fn ok(s: String) -> Option<Result<String, Box<EvalAltResult>>> {
+        Some(Ok(s))
+    }
+    fn falha(codigo: i32) -> Option<Result<String, Box<EvalAltResult>>> {
+        Some(Ok(format!("\n[exit code: {codigo}]")))
+    }
+    let ler = |p: &str| -> Option<String> {
+        let alvo = sandbox.resolve(p).ok()?;
+        fs::read_to_string(alvo).ok()
+    };
+
+    let partes: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+    match partes.as_slice() {
+        ["true"] => ok(String::new()),
+        ["false"] => falha(1),
+        ["pwd"] => ok(format!("{}\n", sandbox.root.display())),
+
+        ["echo", resto @ ..] => ok(format!("{}\n", resto.join(" "))),
+
+        ["cat", arquivos @ ..] if !arquivos.is_empty() && !arquivos.iter().any(|a| a.starts_with('-')) => {
+            let mut saida = String::new();
+            for a in arquivos {
+                match ler(a) {
+                    Some(c) => saida.push_str(&c),
+                    // Sem inventar mensagem de erro do cat: devolve o comando
+                    // pro shell, que reporta do jeito que o chamador espera.
+                    None => return None,
+                }
+            }
+            ok(saida)
+        }
+
+        ["basename", caminho] => {
+            ok(format!("{}\n", std::path::Path::new(caminho).file_name()?.to_string_lossy()))
+        }
+        ["dirname", caminho] => {
+            let pai = std::path::Path::new(caminho).parent()?;
+            let texto = pai.to_string_lossy();
+            ok(format!("{}\n", if texto.is_empty() { "." } else { &texto }))
+        }
+
+        ["ls"] | ["ls", "-1"] => listar(sandbox, "."),
+        ["ls", dir] | ["ls", "-1", dir] if !dir.starts_with('-') => listar(sandbox, dir),
+
+        ["test", "-f", alvo] => {
+            let existe = sandbox.resolve(alvo).map(|p| p.is_file()).unwrap_or(false);
+            if existe { ok(String::new()) } else { falha(1) }
+        }
+        ["test", "-d", alvo] => {
+            let existe = sandbox.resolve(alvo).map(|p| p.is_dir()).unwrap_or(false);
+            if existe { ok(String::new()) } else { falha(1) }
+        }
+        ["test", "-e", alvo] => {
+            let existe = sandbox.resolve(alvo).map(|p| p.exists()).unwrap_or(false);
+            if existe { ok(String::new()) } else { falha(1) }
+        }
+
+        ["head", "-n", n, arquivo] => {
+            let limite: usize = n.parse().ok()?;
+            let conteudo = ler(arquivo)?;
+            let mut saida: String =
+                conteudo.lines().take(limite).map(|l| format!("{l}\n")).collect();
+            if saida.is_empty() && !conteudo.is_empty() {
+                saida.push('\n');
+            }
+            ok(saida)
+        }
+
+        ["mkdir", "-p", dir] => {
+            let alvo = sandbox.resolve(dir).ok()?;
+            match fs::create_dir_all(alvo) {
+                Ok(()) => ok(String::new()),
+                Err(_) => None,
+            }
+        }
+        ["touch", arquivo] => {
+            let alvo = sandbox.resolve(arquivo).ok()?;
+            if alvo.exists() {
+                // `touch` num arquivo existente so mexe no mtime; deixa pro
+                // shell, que faz isso direito.
+                return None;
+            }
+            match fs::write(&alvo, "") {
+                Ok(()) => ok(String::new()),
+                Err(_) => None,
+            }
+        }
+        ["rm", arquivo] | ["rm", "-f", arquivo] => {
+            let alvo = sandbox.resolve(arquivo).ok()?;
+            if alvo.is_dir() {
+                return None;
+            }
+            match fs::remove_file(&alvo) {
+                Ok(()) => ok(String::new()),
+                Err(_) if partes[1] == "-f" => ok(String::new()),
+                Err(_) => None,
+            }
+        }
+        ["cp", origem, destino] => {
+            let de = sandbox.resolve(origem).ok()?;
+            let para = sandbox.resolve(destino).ok()?;
+            if de.is_dir() || para.is_dir() {
+                return None;
+            }
+            match fs::copy(&de, &para) {
+                Ok(_) => ok(String::new()),
+                Err(_) => None,
+            }
+        }
+        ["mv", origem, destino] => {
+            let de = sandbox.resolve(origem).ok()?;
+            let para = sandbox.resolve(destino).ok()?;
+            if para.is_dir() {
+                return None;
+            }
+            match fs::rename(&de, &para) {
+                Ok(()) => ok(String::new()),
+                Err(_) => None,
+            }
+        }
+
+        // `grep -rn PADRAO CAMINHO`: mesma forma de saida do nosso grep
+        // nativo (caminho:linha:texto), que agora respeita .gitignore.
+        ["grep", flags, padrao, caminho] if flags == &"-rn" || flags == &"-nr" => {
+            Some(grep_impl(sandbox, padrao, caminho))
+        }
+        _ => None,
+    }
+}
+
+fn listar(sandbox: &Sandbox, dir: &str) -> Option<Result<String, Box<EvalAltResult>>> {
+    let alvo = sandbox.resolve(dir).ok()?;
+    let entradas = fs::read_dir(alvo).ok()?;
+    let mut nomes: Vec<String> = entradas
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        // `ls` sem -a nao mostra oculto.
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    nomes.sort();
+    Some(Ok(nomes.into_iter().map(|n| format!("{n}\n")).collect()))
+}
+
 fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String, Box<EvalAltResult>> {
     if sandbox.dry {
         eprintln!("codemode: [dry-run] run_shell({cmd:?})");
@@ -527,6 +683,16 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
         w.first().map(|first| RTK_WORTH_ROUTING.contains(&first.as_str())).unwrap_or(false)
             && !grep_shape_rtk_would_passthrough(w)
     });
+
+    // Antes de qualquer spawn: o comando trivial resolvido aqui dentro custa
+    // 0,02ms contra 1,5-8,5ms de processo (#29). So a forma exata entra.
+    if let Some(words) = &plain {
+        if !sandbox.dry {
+            if let Some(resultado) = try_comando_nativo(words, sandbox) {
+                return resultado;
+            }
+        }
+    }
 
     if routed {
         if let Some(words) = &plain {
