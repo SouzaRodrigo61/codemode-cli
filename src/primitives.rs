@@ -505,12 +505,10 @@ fn try_comando_nativo(words: &[String], sandbox: &Sandbox) -> Option<Result<Stri
         ["cat", arquivos @ ..] if !arquivos.is_empty() && !arquivos.iter().any(|a| a.starts_with('-')) => {
             let mut saida = String::new();
             for a in arquivos {
-                match ler(a) {
-                    Some(c) => saida.push_str(&c),
-                    // Sem inventar mensagem de erro do cat: devolve o comando
-                    // pro shell, que reporta do jeito que o chamador espera.
-                    None => return None,
-                }
+                // `?` aqui devolve None e manda o comando pro shell: sem
+                // inventar mensagem de erro do cat, que o chamador espera no
+                // formato do binario real.
+                saida.push_str(&ler(a)?);
             }
             ok(saida)
         }
