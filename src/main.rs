@@ -493,7 +493,18 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
             // Watchdog fallback: still not done past the hard deadline.
             // The eval thread may be stuck in a blocking native call; we
             // cannot safely join/kill it, so exit the whole process.
-            eprintln!("codemode: script exceeded {timeout_secs}s timeout (watchdog), aborting process");
+            // Nomear o que estava em voo transforma um exit 124 mudo em
+            // diagnóstico: sem isto, a execução inteira vira lixo e alguém
+            // reescreve o script só para bissectar qual comando pendurou (#79).
+            match primitives::em_voo() {
+                Some(alvo) => eprintln!(
+                    "codemode: script exceeded {timeout_secs}s timeout (watchdog) durante {alvo}, aborting process"
+                ),
+                None => eprintln!(
+                    "codemode: script exceeded {timeout_secs}s timeout (watchdog), aborting process -- \
+                     nenhuma chamada nativa em voo: provavelmente laço puro de VM (veja --vm-idle)"
+                ),
+            }
             record_run(&meta, &counter, &sink, 124, started);
             std::process::exit(124);
         }
