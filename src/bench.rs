@@ -32,6 +32,11 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
         let status = Command::new(&exe)
             .args(["run", &args.script, "--workdir"])
             .arg(&args.workdir)
+            // Iteração de benchmark não é uso: sem isto, `bench --n 30` grava
+            // 30 linhas em runs.jsonl e o `codemode gain` passa a reportar
+            // trabalho que nunca existiu. Aconteceu de verdade: das 328
+            // execuções registradas na série v1.0, 310 eram benchmark (#36).
+            .env("CODEMODE_NO_TELEMETRY", "1")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
