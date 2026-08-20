@@ -129,6 +129,11 @@ enum Commands {
         /// How many runs `--history` lists.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Report the EXCLUDED segment instead -- benchmark cases, scratch
+        /// scripts in a temp dir, and codemode developing itself. The
+        /// default report covers real work only.
+        #[arg(long)]
+        bench: bool,
     },
     /// Time a .rhai script's real wall-clock cost, natively -- no Python/shell
     /// timing harness, no interpreter-spawn overhead skewing the result.
@@ -205,8 +210,8 @@ fn main() {
                 }
             }
         }
-        Commands::Gain { history, json, limit } => {
-            match gain::run(gain::GainArgs { history, json, limit }) {
+        Commands::Gain { history, json, limit, bench } => {
+            match gain::run(gain::GainArgs { history, json, limit, bench }) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("codemode: {e}");
@@ -288,6 +293,17 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
             .unwrap_or_else(|_| workdir.to_path_buf())
             .display()
             .to_string(),
+        kind: String::new(),
+    };
+    // `--dry-run` não executa nada: contá-la como trabalho real inflaria o
+    // relatório com execução que nunca tocou em arquivo nenhum.
+    let meta = RunMeta {
+        kind: if dry_run {
+            "check".to_string()
+        } else {
+            telemetry::classify(&meta.workdir, meta.name.as_deref())
+        },
+        ..meta
     };
 
     let sandbox = Sandbox::new(workdir)?
@@ -557,6 +573,10 @@ struct RunMeta {
     source: String,
     name: Option<String>,
     workdir: String,
+    /// Classificado uma vez, na entrada: "real" | "bench" | "self" | "check".
+    /// Gravar aqui, e não deduzir na leitura, é o que torna o relatório do
+    /// #59 confiável -- a leitura só reclassifica linha antiga.
+    kind: String,
 }
 
 /// Grava a linha de telemetria. Chamada em TODA saída de `run` -- inclusive
@@ -586,6 +606,7 @@ fn record_run(
         exit_code,
         ms: started.elapsed().as_millis() as u64,
         workdir: meta.workdir.clone(),
+        kind: Some(meta.kind.clone()),
     });
 }
 

@@ -10,6 +10,9 @@ pub struct GainArgs {
     pub history: bool,
     pub json: bool,
     pub limit: usize,
+    /// Relata o segmento EXCLUÍDO (bench, rascunho em /tmp, o próprio
+    /// codemode se desenvolvendo) em vez do trabalho real.
+    pub bench: bool,
 }
 
 struct Agg {
@@ -27,6 +30,9 @@ struct Agg {
     de_biblioteca: usize,
     prims: BTreeMap<String, u64>,
     por_script: BTreeMap<String, usize>,
+    /// Bytes que cada script mandou para o contexto. É o que custa token --
+    /// tool-call evitada não paga nada por si (#59).
+    bytes_por_script: BTreeMap<String, u64>,
 }
 
 fn aggregate(entries: &[Entry]) -> Agg {
@@ -44,6 +50,7 @@ fn aggregate(entries: &[Entry]) -> Agg {
         de_biblioteca: 0,
         prims: BTreeMap::new(),
         por_script: BTreeMap::new(),
+        bytes_por_script: BTreeMap::new(),
     };
     for e in entries {
         if !e.ok() {
@@ -66,7 +73,8 @@ fn aggregate(entries: &[Entry]) -> Agg {
             *a.prims.entry(k.clone()).or_insert(0) += v;
         }
         let rotulo = e.name.clone().unwrap_or_else(|| format!("<{}> {}", e.source, e.script));
-        *a.por_script.entry(rotulo).or_insert(0) += 1;
+        *a.por_script.entry(rotulo.clone()).or_insert(0) += 1;
+        *a.bytes_por_script.entry(rotulo).or_insert(0) += e.out_bytes;
     }
     a
 }
@@ -88,17 +96,46 @@ pub fn run(args: GainArgs) -> Result<i32, String> {
         println!("codemode gain: nenhuma execução registrada ainda ({onde})");
         return Ok(0);
     }
-    let a = aggregate(&entries);
+    // O relatório é sobre TRABALHO REAL. Bench, rascunho em /tmp e o próprio
+    // codemode se desenvolvendo entram numa conta separada -- misturar os dois
+    // foi o que inflou o ganho ~145x e escondeu 33% de falha (#59).
+    let (reais, resto): (Vec<Entry>, Vec<Entry>) =
+        entries.iter().cloned().partition(|e| e.is_real());
+    // Linha antiga cujo workdir sumiu não é contada como real nem como bench --
+    // aparece com nome próprio, para a incerteza ficar visível em vez de virar
+    // número.
+    let (desconhecidas, outros): (Vec<Entry>, Vec<Entry>) =
+        resto.into_iter().partition(|e| e.kind() == "desconhecido");
+    let escolhidas = if args.bench { &outros } else { &reais };
+    let a = aggregate(escolhidas);
 
     if args.json {
-        println!("{}", json_report(&a));
+        println!("{}", json_report(&a, &aggregate(&reais), &aggregate(&outros)));
+        return Ok(0);
+    }
+
+    if escolhidas.is_empty() {
+        let onde = if args.bench { "bench/rascunho/self" } else { "trabalho real" };
+        println!("codemode gain: nenhuma execução de {onde} registrada");
+        if !desconhecidas.is_empty() {
+            println!(
+                "  Não classificáveis: {} (linha anterior ao #59 com workdir já apagado --\n   sem o diretório não há como provar o que era, e chutar infla o número)",
+                desconhecidas.len()
+            );
+        }
+        if !args.bench && !outros.is_empty() {
+            println!(
+                "  ({} execuções gravadas, todas classificadas como bench, rascunho em diretório\n   temporário, ou o próprio codemode se desenvolvendo -- veja com `codemode gain --bench`)",
+                outros.len()
+            );
+        }
         return Ok(0);
     }
 
     if args.history {
-        println!("Últimas {} execuções", args.limit.min(entries.len()));
+        println!("Últimas {} execuções", args.limit.min(escolhidas.len()));
         println!("{:-<78}", "");
-        for e in entries.iter().rev().take(args.limit) {
+        for e in escolhidas.iter().rev().take(args.limit) {
             println!(
                 "{:>10}  {:<28} {:>3} prim  {:>6}ms  {:>7}B  {}",
                 e.ts,
@@ -112,13 +149,29 @@ pub fn run(args: GainArgs) -> Result<i32, String> {
         println!();
     }
 
-    println!("codemode gain");
+    println!(
+        "codemode gain{}",
+        if args.bench { " -- bench / rascunho / self" } else { " -- trabalho real" }
+    );
     println!("{:=<78}", "");
+    if !args.bench && !outros.is_empty() {
+        println!(
+            "Fora da conta:        {:>8}  (bench, /tmp, o próprio codemode -- `--bench` mostra)",
+            outros.len()
+        );
+    }
+    if !args.bench && !desconhecidas.is_empty() {
+        println!(
+            "Não classificáveis:   {:>8}  (linha anterior ao #59 com workdir já apagado)",
+            desconhecidas.len()
+        );
+    }
     println!("Execuções:            {:>8}", a.runs);
     println!("Primitivas:           {:>8}", a.prim_total);
     println!("Tool-calls evitadas:  {:>8}", a.calls_avoided);
     println!("Falhas:               {:>8}  ({:.1}%)", a.falhas, pct(a.falhas, a.runs));
     println!("Saída total:          {:>8}B", a.out_bytes);
+    println!("Saída por execução:   {:>8}B  (o que de fato vira token)", media(a.out_bytes, a.runs));
     println!("Tempo total:          {:>8}ms", a.ms);
     println!();
     println!("Por bucket de primitivas");
@@ -147,7 +200,27 @@ pub fn run(args: GainArgs) -> Result<i32, String> {
     for (nome, n) in scripts.iter().take(10) {
         println!("  {nome:<48} {n:>4}x");
     }
+    println!();
+
+    // Um script que evita 10 tool-calls e despeja 200KB no contexto é
+    // prejuízo líquido. Sem esta lista o relatório o exibia como vitória.
+    println!("Maiores despejos de contexto");
+    println!("{:-<78}", "");
+    let mut despejos: Vec<_> = a.bytes_por_script.iter().collect();
+    despejos.sort_by(|x, y| y.1.cmp(x.1));
+    for (nome, bytes) in despejos.iter().take(5) {
+        let execs = a.por_script.get(*nome).copied().unwrap_or(1);
+        println!("  {:<48} {:>8}B  em {:>3}x", nome, bytes, execs);
+    }
     Ok(0)
+}
+
+fn media(total: u64, n: usize) -> u64 {
+    if n == 0 {
+        0
+    } else {
+        total / n as u64
+    }
 }
 
 fn linha_bucket(rotulo: &str, n: usize, total: usize) {
@@ -156,23 +229,28 @@ fn linha_bucket(rotulo: &str, n: usize, total: usize) {
     println!("  {:<34} {:>5}  {:>5.1}%  {}", rotulo, n, p, "█".repeat(barras));
 }
 
-fn json_report(a: &Agg) -> String {
+fn json_report(a: &Agg, reais: &Agg, outros: &Agg) -> String {
     let prims: Vec<String> =
         a.prims.iter().map(|(k, v)| format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), v)).collect();
     format!(
-        "{{\"runs\":{},\"falhas\":{},\"prim_total\":{},\"calls_avoided\":{},\"out_bytes\":{},\"ms\":{},\
-\"buckets\":{{\"0\":{},\"1\":{},\"2\":{},\"3+\":{}}},\"de_biblioteca\":{},\"prims\":{{{}}}}}",
+        "{{\"runs\":{},\"falhas\":{},\"prim_total\":{},\"calls_avoided\":{},\"out_bytes\":{},\
+\"out_bytes_por_run\":{},\"ms\":{},\
+\"buckets\":{{\"0\":{},\"1\":{},\"2\":{},\"3+\":{}}},\"de_biblioteca\":{},\"prims\":{{{}}},\
+\"segmentos\":{{\"real\":{},\"excluido\":{}}}}}",
         a.runs,
         a.falhas,
         a.prim_total,
         a.calls_avoided,
         a.out_bytes,
+        media(a.out_bytes, a.runs),
         a.ms,
         a.b0,
         a.b1,
         a.b2,
         a.b3,
         a.de_biblioteca,
-        prims.join(",")
+        prims.join(","),
+        reais.runs,
+        outros.runs
     )
 }
