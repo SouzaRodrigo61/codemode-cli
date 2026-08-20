@@ -149,6 +149,80 @@ fn read_file_impl(sandbox: &Sandbox, path: &str) -> Result<String, Box<EvalAltRe
     String::from_utf8(buf).map_err(|_| to_err(format!("read_file: {:?} is not valid UTF-8", path)))
 }
 
+/// Faixa de linhas, 1-based e inclusiva nas duas pontas -- como editor e como
+/// `sed -n 'i,jp'`, nao como slice de Rust. Aceita "120-180", "120-" (dali ate
+/// o fim) e "120" (so aquela).
+///
+/// Existe porque `read_file` e a primitiva mais usada da ferramenta (20.729
+/// chamadas na telemetria do #58) e lia SEMPRE o arquivo inteiro: um script que
+/// precisava de 20 linhas pagava o arquivo todo, e o que fosse impresso virava
+/// token de contexto (#61).
+///
+/// Para em `fim` em vez de ler ate o EOF -- o ganho e nao materializar o resto,
+/// nao so nao devolve-lo.
+fn faixa_de_linhas(spec: &str) -> Result<(usize, usize), Box<EvalAltResult>> {
+    let spec = spec.trim();
+    let erro = || {
+        to_err(format!(
+            "read_file: lines {spec:?} is not a range -- use \"120-180\", \"120-\" or \"120\""
+        ))
+    };
+    let (ini_txt, fim_txt) = match spec.split_once('-') {
+        Some((a, "")) => (a, None),
+        Some((a, b)) => (a, Some(b)),
+        None => (spec, Some(spec)),
+    };
+    let ini: usize = ini_txt.trim().parse().map_err(|_| erro())?;
+    if ini == 0 {
+        return Err(to_err("read_file: lines is 1-based; line 0 does not exist"));
+    }
+    let fim = match fim_txt {
+        Some(b) => {
+            let f: usize = b.trim().parse().map_err(|_| erro())?;
+            if f < ini {
+                return Err(to_err(format!(
+                    "read_file: lines {spec:?} ends before it starts ({f} < {ini})"
+                )));
+            }
+            f
+        }
+        None => usize::MAX,
+    };
+    Ok((ini, fim))
+}
+
+fn read_file_faixa(
+    sandbox: &Sandbox,
+    path: &str,
+    spec: &str,
+) -> Result<String, Box<EvalAltResult>> {
+    use std::io::BufRead;
+    let (ini, fim) = faixa_de_linhas(spec)?;
+    let resolved = sandbox.resolve(path).map_err(to_err)?;
+    let f = fs::File::open(&resolved).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            to_err(format!("read_file: {:?} does not exist", path))
+        } else {
+            to_err(format!("read_file: {:?}: {e}", path))
+        }
+    })?;
+    let mut out = String::new();
+    for (i, linha) in std::io::BufReader::new(f).lines().enumerate() {
+        let n = i + 1;
+        if n < ini {
+            continue;
+        }
+        if n > fim {
+            break;
+        }
+        let linha =
+            linha.map_err(|_| to_err(format!("read_file: {:?} is not valid UTF-8", path)))?;
+        out.push_str(&linha);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 // ---- write_file ----
 
 fn write_file_impl(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), Box<EvalAltResult>> {
@@ -1730,6 +1804,24 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>,
         bump(&ct, "read_file");
         read_file_impl(&sb, path)
     });
+
+    // `read_file(caminho, #{lines: "120-180"})` -- mesma primitiva, mesma
+    // contagem na telemetria: e a MESMA operacao, so que sem pagar o arquivo
+    // inteiro para olhar um trecho (#61).
+    let sb = sandbox.clone();
+    let ct = counter.clone();
+    engine.register_fn(
+        "read_file",
+        move |path: &str, opcoes: rhai::Map| -> Result<String, Box<EvalAltResult>> {
+            bump(&ct, "read_file");
+            let Some(spec) = opcoes.get("lines") else {
+                return Err(to_err(
+                    "read_file: second argument takes #{lines: \"120-180\"} -- no other key is supported",
+                ));
+            };
+            read_file_faixa(&sb, path, &spec.to_string())
+        },
+    );
 
     let sb = sandbox.clone();
     let ct = counter.clone();
