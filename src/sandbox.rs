@@ -4,6 +4,44 @@
 
 use std::path::{Component, Path, PathBuf};
 
+/// Cache de resolucao por execucao (#37).
+///
+/// Medido: `resolve` custa **9,28us** de ~24us de um `read_file` -- 38% do
+/// caminho de arquivo, gasto quase todo em `canonicalize` e no passeio pelos
+/// ancestrais. Num laco que le o mesmo arquivo (ou o mesmo diretorio) N
+/// vezes, e o mesmo syscall N vezes.
+///
+/// A regra que mantem isso seguro: **qualquer mutacao invalida tudo**. Toda
+/// primitiva que escreve, e todo comando de shell, chamam `invalidar()`
+/// antes de agir -- um symlink criado no meio da execucao nao pode ser
+/// resolvido por um cache montado antes dele existir.
+#[derive(Clone, Default)]
+pub struct CacheResolucao {
+    mapa: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>>,
+}
+
+impl CacheResolucao {
+    fn busca(&self, chave: &str) -> Option<PathBuf> {
+        self.mapa.lock().ok()?.get(chave).cloned()
+    }
+
+    fn guarda(&self, chave: &str, valor: &Path) {
+        if let Ok(mut m) = self.mapa.lock() {
+            // Teto pra script que toca milhares de caminhos distintos: o
+            // cache existe pro laco repetido, nao pra virar indice do disco.
+            if m.len() < 4096 {
+                m.insert(chave.to_string(), valor.to_path_buf());
+            }
+        }
+    }
+
+    pub fn invalidar(&self) {
+        if let Ok(mut m) = self.mapa.lock() {
+            m.clear();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Sandbox {
     /// Modo `--dry-run`: primitiva que mutaria disco ou rodaria comando
@@ -14,6 +52,8 @@ pub struct Sandbox {
     pub cmd_timeout: u64,
     /// Canonicalized root. All resolved paths must live under this.
     pub root: PathBuf,
+    /// Resolucoes ja feitas nesta execucao (#37).
+    pub cache: CacheResolucao,
     /// Raízes adicionais de `--extra-root` (#4). O ecossistema é multi-repo:
     /// sem isso, toda tarefa que cruza repositório cai fora do codemode.
     /// Cada raiz é confinada individualmente -- não há caminho entre elas.
@@ -56,7 +96,7 @@ impl Sandbox {
     pub fn new(workdir: &Path) -> Result<Self, String> {
         let root = std::fs::canonicalize(workdir)
             .map_err(|e| format!("workdir {:?} does not exist or is inaccessible: {e}", workdir))?;
-        Ok(Sandbox { root, dry: false, cmd_timeout: 600, extra_roots: Vec::new() })
+        Ok(Sandbox { root, dry: false, cmd_timeout: 600, cache: CacheResolucao::default(), extra_roots: Vec::new() })
     }
 
     /// Canonicaliza o ancestral existente mais longo e recoloca o resto do
@@ -101,6 +141,15 @@ impl Sandbox {
     /// exist (needed for `write_file`), but if any existing ancestor is a
     /// symlink pointing outside the sandbox, resolution fails.
     pub fn resolve(&self, input: &str) -> Result<PathBuf, String> {
+        if let Some(pronto) = self.cache.busca(input) {
+            return Ok(pronto);
+        }
+        let resolvido = self.resolve_sem_cache(input)?;
+        self.cache.guarda(input, &resolvido);
+        Ok(resolvido)
+    }
+
+    fn resolve_sem_cache(&self, input: &str) -> Result<PathBuf, String> {
         let p = Path::new(input);
         let candidate = if p.is_absolute() {
             p.to_path_buf()

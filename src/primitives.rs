@@ -152,6 +152,8 @@ fn read_file_impl(sandbox: &Sandbox, path: &str) -> Result<String, Box<EvalAltRe
 // ---- write_file ----
 
 fn write_file_impl(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), Box<EvalAltResult>> {
+    // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
+    sandbox.cache.invalidar();
     if sandbox.dry {
         eprintln!("codemode: [dry-run] write_file({path:?}, {} bytes)", content.len());
         return Ok(());
@@ -178,6 +180,8 @@ fn shrinks_dangerously(old_len: u64, new_len: u64) -> bool {
 }
 
 fn write_file_guarded(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), Box<EvalAltResult>> {
+    // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
+    sandbox.cache.invalidar();
     let resolved = sandbox.resolve(path).map_err(to_err)?;
     if let Ok(meta) = fs::metadata(&resolved) {
         if meta.is_file() && shrinks_dangerously(meta.len(), content.len() as u64) {
@@ -212,6 +216,8 @@ fn write_file_guarded(sandbox: &Sandbox, path: &str, content: &str) -> Result<()
 /// existing can be lost. This is what a `read_file` + `write_file`
 /// "append" loop should have been.
 fn append_file_impl(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), Box<EvalAltResult>> {
+    // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
+    sandbox.cache.invalidar();
     if sandbox.dry {
         eprintln!("codemode: [dry-run] append_file({path:?}, {} bytes)", content.len());
         return Ok(());
@@ -233,6 +239,8 @@ fn append_file_impl(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), 
 // ---- edit_file ----
 
 fn edit_file_impl(sandbox: &Sandbox, path: &str, old: &str, new: &str) -> Result<(), Box<EvalAltResult>> {
+    // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
+    sandbox.cache.invalidar();
     if sandbox.dry {
         eprintln!("codemode: [dry-run] edit_file({path:?}, {} -> {} bytes)", old.len(), new.len());
         return Ok(());
@@ -860,6 +868,8 @@ fn tenta_pipeline(cmd: &str, sandbox: &Sandbox) -> Option<Result<String, Box<Eva
 }
 
 fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String, Box<EvalAltResult>> {
+    // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
+    sandbox.cache.invalidar();
     if sandbox.dry {
         eprintln!("codemode: [dry-run] run_shell({cmd:?})");
         return Ok(String::new());
@@ -994,6 +1004,8 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
 /// `run_shell_full` (raw, typed). Same denylist gate, same uncatchable
 /// refusal.
 fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Map, Box<EvalAltResult>> {
+    // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
+    sandbox.cache.invalidar();
     if sandbox.dry {
         eprintln!("codemode: [dry-run] run_shell_full({cmd:?})");
         let mut m = Map::new();

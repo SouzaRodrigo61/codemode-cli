@@ -279,3 +279,42 @@ fn grep_nativo_devolve_resultado_ordenado() {
     ordenado.sort();
     assert_eq!(ordem, ordenado, "saída deve vir ordenada por caminho: {saida}");
 }
+
+#[test]
+fn cache_de_resolucao_nao_sobrevive_a_uma_mutacao() {
+    // O cache do #37 só vale entre mutações: um symlink criado no meio da
+    // execução não pode ser resolvido por um cache montado antes dele.
+    let dir = tempfile::tempdir().unwrap();
+    let fora = tempfile::tempdir().unwrap();
+    fs::write(fora.path().join("segredo.txt"), "de fora\n").unwrap();
+    fs::create_dir_all(dir.path().join("ponte")).unwrap();
+    fs::write(dir.path().join("ponte/segredo.txt"), "de dentro\n").unwrap();
+
+    let s = escreve(
+        dir.path(),
+        &format!(
+            r#"
+// Resolve uma vez com o diretório real...
+print("antes=" + trimmed(read_file("ponte/segredo.txt")));
+// ...troca o diretório por um symlink pra fora...
+run_shell("rm ponte/segredo.txt");
+run_shell("rmdir ponte");
+run_shell("ln -s {fora} ponte");
+// ...e a segunda leitura tem que ser barrada, não servida do cache.
+try {{
+    let x = read_file("ponte/segredo.txt");
+    print("VAZOU=" + trimmed(x));
+}} catch (e) {{
+    print("bloqueado");
+}}
+"#,
+            fora = fora.path().display()
+        ),
+    );
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("antes=de dentro"))
+        .stdout(predicates::str::contains("bloqueado"));
+}
