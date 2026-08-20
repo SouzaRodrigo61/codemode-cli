@@ -10,7 +10,13 @@
 // o Rhai não aceita dentro de string, e o parse do lado de cá é o mesmo custo.
 
 fn campo(mapa, chave, padrao) {
-    if mapa.contains(chave) && type_of(mapa[chave]) != "()" { mapa[chave] } else { padrao }
+    if !mapa.contains(chave) { return padrao; }
+    let v = mapa[chave];
+    // Check em execução vem com `conclusion` VAZIA, não ausente -- tratar só o
+    // ausente deixava a linha sair como "test: bench:" sem dizer nada.
+    if type_of(v) == "()" { return padrao; }
+    if type_of(v) == "string" && v == "" { return padrao; }
+    v
 }
 
 let numeros = [];
