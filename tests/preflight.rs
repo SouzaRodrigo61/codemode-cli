@@ -302,3 +302,35 @@ fn igual_dentro_de_string_nao_e_atribuicao() {
         .success()
         .stdout(predicates::str::contains("limpo=oi"));
 }
+
+#[test]
+fn sugestao_de_primitiva_unica_nao_trunca_em_aspa_escapada() {
+    // #80: o parser parava na primeira aspa QUALQUER, entao
+    // `run_shell("sh -c \"ls -la\"")` virava a sugestao inutil `sh -c \`.
+    // O aviso falhava exatamente quando o comando era nao-trivial -- que e
+    // quando a sugestao importa.
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(&s, "print(run_shell(\"sh -c \\\"ls -la\\\"\"));\n").unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        // A aspa escapada volta ao literal: quem vai colar no shell quer
+        // `sh -c "ls -la"`, nao o escape do Rhai.
+        .stderr(predicates::str::contains("o equivalente direto é: sh -c \"ls -la\""));
+}
+
+#[test]
+fn sugestao_de_primitiva_unica_segue_funcionando_no_comando_simples() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(&s, "print(run_shell(\"echo ola\"));\n").unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("o equivalente direto é: echo ola"));
+}
