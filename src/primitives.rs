@@ -1611,6 +1611,19 @@ fn glob_impl(sandbox: &Sandbox, pattern: &str) -> Result<Array, Box<EvalAltResul
         sandbox.resolve(prefixo).map_err(to_err)?
     };
     if !inicio.exists() {
+        // Prefixo literal e diretorio que o CHAMADOR nomeou: se nao existe, o
+        // provavel e typo, e devolver [] deixa o script seguir sem fazer nada
+        // -- resultado errado sem sinal, a familia do #60 (#72). `read_file` de
+        // arquivo inexistente erra; glob era o outlier.
+        //
+        // Padrao sem prefixo literal (`glob("**/*.rs")`) comeca no root, que
+        // sempre existe, entao "nada casou" continua sendo [] legitimo.
+        if !prefixo.is_empty() {
+            return Err(to_err(format!(
+                "glob: {prefixo:?} does not exist -- \
+                 check the path, or use path_exists() first if it is optional"
+            )));
+        }
         return Ok(Array::new());
     }
     let pediu_ignorado = !prefixo.is_empty() && caminho_ignorado(&sandbox.root, &inicio);
