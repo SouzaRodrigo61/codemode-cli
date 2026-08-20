@@ -1343,7 +1343,14 @@ fn glob_impl(sandbox: &Sandbox, pattern: &str) -> Result<Array, Box<EvalAltResul
         return Err(to_err("glob: `..` is not allowed in patterns"));
     }
 
+    let absoluto = std::path::Path::new(pattern).is_absolute();
     let prefixo = prefixo_literal(pattern);
+    if absoluto && prefixo.is_empty() {
+        return Err(to_err(format!(
+            "glob: absolute pattern {pattern:?} has no literal directory to start from -- \
+             anchor it (\"/dir/**/*.rs\"), or use a pattern relative to the workdir"
+        )));
+    }
     let inicio = if prefixo.is_empty() {
         sandbox.root.clone()
     } else {
@@ -1365,18 +1372,32 @@ fn glob_impl(sandbox: &Sandbox, pattern: &str) -> Result<Array, Box<EvalAltResul
         .git_exclude(!pediu_ignorado)
         .hidden(false);
 
+    // Padrao absoluto casa contra caminho absoluto; relativo, contra o caminho
+    // relativo ao root. Sem esta distincao, `glob("/abs/*.md")` percorria o
+    // diretorio certo e comparava o padrao absoluto com entrada relativa --
+    // nunca casava nada e devolvia [] em silencio (#60).
+    //
+    // O prefixo devolvido e o que o CHAMADOR escreveu, nao o canonico: no
+    // macOS `/tmp` resolve para `/private/tmp`, e devolver o canonico faria o
+    // padrao do proprio chamador nao casar com o proprio resultado.
+    let base = if absoluto { &inicio } else { &sandbox.root };
     let mut out: Vec<String> = Vec::new();
     for entrada in construtor.build().flatten() {
         if entrada.file_name() == ".git" {
             continue;
         }
-        let Ok(rel) = entrada.path().strip_prefix(&sandbox.root) else { continue };
+        let Ok(rel) = entrada.path().strip_prefix(base) else { continue };
         let rel_txt = rel.to_string_lossy().to_string();
         if rel_txt.is_empty() {
             continue;
         }
-        if padrao.matches_with(&rel_txt, opcoes) {
-            out.push(rel_txt);
+        let texto = if absoluto {
+            format!("{}/{}", prefixo.trim_end_matches('/'), rel_txt)
+        } else {
+            rel_txt
+        };
+        if padrao.matches_with(&texto, opcoes) {
+            out.push(texto);
         }
     }
     // Walker devolve fora de ordem; resultado de glob precisa ser estavel.
