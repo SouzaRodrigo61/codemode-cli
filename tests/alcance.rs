@@ -459,3 +459,40 @@ fn glob_absoluto_fora_de_qualquer_root_e_erro_explicito() {
         .failure()
         .stderr(predicates::str::contains("outside sandbox workdir"));
 }
+
+#[test]
+fn glob_absoluto_sem_curinga_encontra_o_arquivo_exato() {
+    // Canto que o #60 nao cobriu: quando o padrao absoluto nomeia um ARQUIVO
+    // e nao tem curinga, o walker devolve so ele e o caminho relativo sai
+    // vazio -- que era descartado, devolvendo [] em silencio. Mesma classe de
+    // falha que a issue corrigia, sobrevivendo dentro da propria correcao.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("um.md"), "conteudo").unwrap();
+    fs::write(dir.path().join("dois.md"), "conteudo").unwrap();
+    let raiz = fs::canonicalize(dir.path()).unwrap();
+
+    let s = escreve(
+        dir.path(),
+        &format!(
+            r#"
+let exato = glob("{raiz}/um.md");
+print("exato=" + exato.len());
+print("caminho=" + exato[0]);
+print("curinga=" + glob("{raiz}/*.md").len());
+print("relativo=" + glob("um.md").len());
+"#,
+            raiz = raiz.display()
+        ),
+    );
+
+    let esperado = format!("caminho={}/um.md", raiz.display());
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("exato=1"))
+        .stdout(predicates::str::contains(esperado))
+        .stdout(predicates::str::contains("curinga=2"))
+        // Relativo sem curinga ja funcionava e continua igual.
+        .stdout(predicates::str::contains("relativo=1"));
+}

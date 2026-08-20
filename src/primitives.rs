@@ -1589,12 +1589,20 @@ fn glob_impl(sandbox: &Sandbox, pattern: &str) -> Result<Array, Box<EvalAltResul
         }
         let Ok(rel) = entrada.path().strip_prefix(base) else { continue };
         let rel_txt = rel.to_string_lossy().to_string();
-        if rel_txt.is_empty() {
-            continue;
-        }
         let texto = if absoluto {
-            format!("{}/{}", prefixo.trim_end_matches('/'), rel_txt)
+            // Prefixo que nomeia um ARQUIVO (padrao absoluto sem curinga:
+            // `glob("/dir/f.md")`) faz o walker devolver so ele, e o rel sai
+            // vazio. Descartar aqui devolvia [] em silencio -- a mesma falha
+            // que o #60 corrigiu, sobrevivendo num canto que o #60 nao cobriu.
+            if rel_txt.is_empty() {
+                prefixo.to_string()
+            } else {
+                format!("{}/{}", prefixo.trim_end_matches('/'), rel_txt)
+            }
         } else {
+            if rel_txt.is_empty() {
+                continue;
+            }
             rel_txt
         };
         if padrao.matches_with(&texto, opcoes) {
