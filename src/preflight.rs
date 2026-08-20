@@ -51,8 +51,47 @@ fn has_loop(ast: &AST) -> bool {
     found
 }
 
+/// Vocabulário que sabemos existir sem perguntar ao engine: as nossas
+/// primitivas, a stdlib que registramos, os operadores, e os builtins de
+/// Rhai que aparecem em script de verdade.
+///
+/// Existe porque `gen_fn_signatures` formata a assinatura COMPLETA de todas
+/// as 223 funções registradas só pra extrair o nome antes do parêntese --
+/// 0,83ms em toda execução, a maior fatia isolada de um script trivial
+/// (#40). Errar pra menos aqui é seguro: nome que não estiver nesta lista
+/// simplesmente cai no caminho lento, que continua correto.
+/// Formas que o PARSER resolve, não o registro de funções: não aparecem em
+/// `gen_fn_signatures` e por isso ficam fora do teste de invariante.
+const PALAVRAS_DA_LINGUAGEM: &[&str] = &[
+    "+", "-", "*", "/", "%", "**", "==", "!=", "<", "<=", ">", ">=", "&&", "||", "!", "&", "|",
+    "^", "..", "..=", "in", "call", "curry", "eval", "type_of", "is_def_var", "is_def_fn",
+];
+
+/// Builtins de Rhai que os scripts usam de verdade. Cada nome aqui É
+/// registrado pelo engine -- o teste `lista_rapida_e_subconjunto_do_que_o_engine_registra`
+/// garante isso, e foi ele que pegou `max` sumindo quando o #41 trocou os
+/// pacotes.
+const CONHECIDOS_RAPIDOS: &[&str] = &[
+    // núcleo
+    "print", "debug", "len", "is_empty", "to_string", "to_int", "to_float",
+    "parse_int", "parse_float", "abs", "sign", "min", "max", "floor", "round", "sqrt",
+    "exp", "ln", "log", "sin", "cos", "tan", "int",
+    // string
+    "trim", "to_upper", "to_lower", "sub_string", "split", "index_of", "contains", "replace",
+    "starts_with", "ends_with", "chars", "pad", "crop", "truncate", "bytes",
+    "split_rev", "make_upper", "make_lower", "to_chars",
+    // array e mapa
+    "push", "pop", "insert", "remove", "clear", "shift", "extract", "keys", "values",
+    "sort", "reverse", "filter", "map", "reduce", "reduce_rev", "some", "all", "find", "find_map",
+    "dedup", "drain", "retain", "append", "get", "set", "fill_with",
+    "mixin", "range", "chop", "take", "for_each",
+    // tempo
+    "timestamp", "elapsed",
+];
+
 /// Nomes registrados no engine (inclui os pacotes padrão do Rhai) mais as
-/// funções que o próprio script define.
+/// funções que o próprio script define. Caminho LENTO: só roda quando sobrou
+/// nome que o vocabulário rápido não conhece.
 fn known_names(engine: &Engine, ast: &AST) -> BTreeSet<String> {
     let mut set: BTreeSet<String> = engine
         .gen_fn_signatures(true)
@@ -76,6 +115,11 @@ fn known_names(engine: &Engine, ast: &AST) -> BTreeSet<String> {
 
 /// As primitivas do codemode -- o que distingue "script que colapsa
 /// tool-calls" de "script que só faz conta".
+/// A stdlib que nós registramos (#14) -- separada das primitivas porque
+/// estas não contam para a guarda de trivialidade.
+pub const STDLIB: &[&str] =
+    &["join", "lines", "trimmed", "replaced", "to_json", "from_json", "basename", "dirname"];
+
 pub const PRIMITIVES: &[&str] = &[
     "read_file", "write_file", "write_file_force", "append_file", "edit_file", "run_shell",
     "run_shell_full", "run_shell_confirmed", "grep", "glob", "http_get", "replace_all_in_glob",
@@ -141,6 +185,61 @@ const MUTADORES_UNIT: &[(&str, &str)] = &[
     ("crop", "mute a variável e use ela mesma"),
 ];
 
+/// Troca o conteúdo de cada literal de string por espaços, preservando o
+/// comprimento. Sem isto, `print("str=" + txt.trim())` era acusado de
+/// atribuir o `trim`: o `=` estava DENTRO da string. Falso positivo achado
+/// pelo próprio teste de vocabulário (#41).
+fn sem_literais(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut dentro = false;
+    let mut escapando = false;
+    for c in s.chars() {
+        if dentro {
+            if escapando {
+                escapando = false;
+                out.push(' ');
+                continue;
+            }
+            match c {
+                '\\' => {
+                    escapando = true;
+                    out.push(' ');
+                }
+                '"' => {
+                    dentro = false;
+                    out.push('"');
+                }
+                _ => out.push(' '),
+            }
+        } else if c == '"' {
+            dentro = true;
+            out.push('"');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Dado um trecho que começa no `(`, devolve o que vem depois do `)` que o
+/// fecha. None se os parênteses não fecham.
+fn fecha_parenteses(s: &str) -> Option<&str> {
+    let mut nivel = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => nivel += 1,
+            ')' => {
+                nivel -= 1;
+                if nivel == 0 {
+                    return Some(&s[i + 1..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn mutating_assignments(source: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (i, linha) in source.lines().enumerate() {
@@ -150,17 +249,24 @@ pub fn mutating_assignments(source: &str) -> Vec<String> {
         // Por instrução, não por linha: `let o = r.stdout; o.trim();` é o
         // idioma CERTO (muta e usa a própria variável), e olhar a linha
         // inteira o acusava por causa do `=` da instrução anterior.
-        for instrucao in linha.split(';') {
+        let limpa = sem_literais(linha);
+        for instrucao in limpa.split(';') {
             for (m, dica) in MUTADORES_UNIT {
             let agulha = format!(".{m}(");
             if let Some(at) = instrucao.find(&agulha) {
                 let antes = &instrucao[..at];
                 let atribui = antes.contains('=') && !antes.contains("==") && !antes.contains("!=");
-                if atribui {
+                // `s.trim().len()` é o mesmo erro em outra forma: encadear no
+                // retorno de quem devolve unit.
+                let encadeia = fecha_parenteses(&instrucao[at + agulha.len() - 1..])
+                    .map(|resto| resto.trim_start().starts_with('.'))
+                    .unwrap_or(false);
+                if atribui || encadeia {
                     out.push(format!(
-                        "linha {}: `{}` MUTA em lugar e devolve () -- atribuir isso dá unit, não valor. {}.",
+                        "linha {}: `{}` MUTA em lugar e devolve () -- {} isso dá unit, não valor. {}.",
                         i + 1,
                         m,
+                        if atribui { "atribuir" } else { "encadear em" },
                         dica
                     ));
                 }
@@ -207,9 +313,25 @@ pub fn check(engine: &Engine, source: &str) -> Result<Report, Vec<String>> {
     };
 
     let mut erros: Vec<String> = Vec::new();
-    let conhecidos = known_names(engine, &ast);
     let chamados = called_names(&ast);
-    for nome in &chamados {
+    // Caminho rápido (#40): quase todo script só chama o que já conhecemos
+    // estaticamente. `gen_fn_signatures` -- que formata a assinatura inteira
+    // de 200+ funções -- só roda se sobrou algum nome fora do vocabulário
+    // conhecido, e custava 0,83ms em TODA execução.
+    let suspeitos: Vec<&String> = chamados
+        .iter()
+        .filter(|n| {
+            let s = n.as_str();
+            !CONHECIDOS_RAPIDOS.contains(&s)
+                && !PALAVRAS_DA_LINGUAGEM.contains(&s)
+                && !PRIMITIVES.contains(&s)
+                && !STDLIB.contains(&s)
+                && !ast.iter_functions().any(|f| f.name == s)
+        })
+        .collect();
+    let conhecidos =
+        if suspeitos.is_empty() { BTreeSet::new() } else { known_names(engine, &ast) };
+    for nome in suspeitos {
         if !conhecidos.contains(nome) {
             let sugestao = parecido(nome, &conhecidos)
                 .map(|s| format!(" -- você quis dizer `{s}`?"))
@@ -234,4 +356,34 @@ pub fn check(engine: &Engine, source: &str) -> Result<Report, Vec<String>> {
         warnings: foreign_idiom_hints(source).into_iter().map(str::to_string).collect(),
         ast,
     })
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    /// A lista rápida (#40) só pode ENCURTAR o caminho, nunca inventar
+    /// vocabulário: um nome listado aqui que o engine não registra vira erro
+    /// de runtime que o pré-voo deveria ter pego. Foi assim que a troca de
+    /// pacotes do #41 quase deixou `max` passar.
+    #[test]
+    fn lista_rapida_e_subconjunto_do_que_o_engine_registra() {
+        let mut engine = crate::primitives::nova_engine();
+        let sandbox = crate::sandbox::Sandbox::new(std::path::Path::new(".")).unwrap();
+        crate::primitives::register(&mut engine, sandbox, Vec::new(), crate::primitives::new_counter());
+        let registrados: std::collections::BTreeSet<String> = engine
+            .gen_fn_signatures(true)
+            .into_iter()
+            .map(|s| s.split('(').next().unwrap_or_default().trim().to_string())
+            .collect();
+
+        let ausentes: Vec<&str> = CONHECIDOS_RAPIDOS
+            .iter()
+            .chain(STDLIB.iter())
+            .chain(PRIMITIVES.iter())
+            .copied()
+            .filter(|n| !registrados.contains(*n))
+            .collect();
+        assert!(ausentes.is_empty(), "nomes na lista rápida que o engine NÃO registra: {ausentes:?}");
+    }
 }
