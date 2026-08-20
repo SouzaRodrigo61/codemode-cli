@@ -24,15 +24,31 @@ pub struct OutputSink {
     pub cap: usize,
     pub truncated: bool,
     pub spill_path: Option<std::path::PathBuf>,
+    /// Maior impressao unica da execucao. O aviso de contexto (#62) precisa
+    /// dizer QUEM despejou, nao so que despejou -- quem escreve o script e
+    /// um agente, e ele so corrige na proxima invocacao se souber onde foi.
+    pub maior_push: usize,
     spill_file: Option<fs::File>,
 }
 
 impl OutputSink {
     pub fn new(cap: usize) -> Self {
-        OutputSink { buf: String::new(), cap, truncated: false, spill_path: None, spill_file: None }
+        OutputSink {
+            buf: String::new(),
+            cap,
+            truncated: false,
+            spill_path: None,
+            maior_push: 0,
+            spill_file: None,
+        }
     }
 
     pub fn push(&mut self, s: &str) {
+        // Conta antes de qualquer corte: o que interessa e o tamanho que o
+        // script TENTOU imprimir.
+        if s.len() > self.maior_push {
+            self.maior_push = s.len();
+        }
         if self.truncated {
             self.spill(s);
             return;
