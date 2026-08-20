@@ -1,6 +1,7 @@
 mod bench;
 mod denylist;
 mod gain;
+mod preflight;
 mod maestri;
 mod primitives;
 mod sandbox;
@@ -10,7 +11,7 @@ use clap::{Parser, Subcommand};
 use rhai::Engine;
 use sandbox::Sandbox;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,10 @@ enum Commands {
         /// Print a call log (each primitive invocation) to stderr for debugging.
         #[arg(long)]
         verbose: bool,
+        /// Announce every mutating primitive instead of performing it: no
+        /// write, no edit, no shell command. Reads still run.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
         /// Host allowed for `http_get` (repeatable). Default-closed: with no
         /// --allow-host, every http_get is refused. An entry "h" allows any
         /// port on h; "h:p" allows exactly that port. No wildcards.
@@ -50,6 +55,17 @@ enum Commands {
         /// review-pr.rhai --arg 77`) instead of edited per invocation.
         #[arg(long = "arg")]
         script_args: Vec<String>,
+    },
+    /// Validate a script without running it: compile, resolve every called
+    /// symbol against what is actually registered, and lint. Exits non-zero
+    /// on the first problem -- meant for CI over a repo's `.codemode/`.
+    Check {
+        /// Path to the script, or "-" to read it from stdin.
+        script: String,
+        /// Directory the script is confined to (also where `.codemode/` is
+        /// looked up). Defaults to the current directory.
+        #[arg(long, default_value = ".")]
+        workdir: PathBuf,
     },
     /// Report what the recorded runs actually saved: tool-calls avoided,
     /// error rate, and where the waste is. Reads `~/.codemode/runs.jsonl`.
@@ -92,9 +108,16 @@ const HARD_TIMEOUT_CAP: u64 = 120;
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { script, workdir, timeout, max_output, verbose, allow_host, script_args } => {
-            let timeout = timeout.min(HARD_TIMEOUT_CAP).max(1);
-            match run(&script, &workdir, timeout, max_output, verbose, allow_host, script_args) {
+        Commands::Check { script, workdir } => match check(&script, &workdir) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("codemode: {e}");
+                std::process::exit(1);
+            }
+        },
+        Commands::Run { script, workdir, timeout, max_output, verbose, dry_run, allow_host, script_args } => {
+            let timeout = timeout.clamp(1, HARD_TIMEOUT_CAP);
+            match run(&script, &workdir, timeout, max_output, verbose, dry_run, allow_host, script_args) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("codemode: {e}");
@@ -124,7 +147,7 @@ fn main() {
     }
 }
 
-fn read_script(script: &str, workdir: &PathBuf) -> Result<(String, &'static str), String> {
+fn read_script(script: &str, workdir: &Path) -> Result<(String, &'static str), String> {
     if script == "-" {
         let mut buf = String::new();
         std::io::stdin()
@@ -157,7 +180,8 @@ fn read_script(script: &str, workdir: &PathBuf) -> Result<(String, &'static str)
     }
 }
 
-fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize, verbose: bool, allow_hosts: Vec<String>, script_args: Vec<String>) -> Result<i32, String> {
+#[allow(clippy::too_many_arguments)]
+fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize, verbose: bool, dry_run: bool, allow_hosts: Vec<String>, script_args: Vec<String>) -> Result<i32, String> {
     let started = Instant::now();
     let (source, origem) = read_script(script_arg, workdir)?;
     let counter = primitives::new_counter();
@@ -171,17 +195,32 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
             .to_string(),
     };
 
-    // Fires before the script runs, and regardless of whether it succeeds:
-    // the write-wipe incident this guards against never errored.
-    for w in mutating_method_warnings(&source) {
-        eprintln!("codemode: aviso: {w}");
-    }
-    let sandbox = Sandbox::new(workdir)?;
+    let sandbox = Sandbox::new(workdir)?.with_dry(dry_run);
 
     let mut engine = Engine::new();
     primitives::register(&mut engine, sandbox, allow_hosts, counter.clone());
     maestri::register(&mut engine);
     let sink = primitives::register_output_capture(&mut engine, max_output);
+
+    // Pré-voo: compila, resolve símbolo e linta ANTES da primeira primitiva
+    // (#13/#15/#17). Um `Function not found` na linha 8 costumava aparecer
+    // depois de cinco run_shell já terem rodado.
+    let relatorio = match preflight::check(&engine, &source) {
+        Ok(r) => r,
+        Err(erros) => {
+            for e in &erros {
+                eprintln!("codemode: {e}");
+            }
+            record_run(&meta, &counter, &sink, 1, started);
+            return Ok(1);
+        }
+    };
+    for w in &relatorio.warnings {
+        eprintln!("codemode: dica: {w}");
+    }
+    if dry_run {
+        eprintln!("codemode: --dry-run: nada será escrito nem executado");
+    }
 
     if verbose {
         eprintln!("codemode: workdir={:?} timeout={}s max_output={}B", std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.clone()), timeout_secs, max_output);
@@ -212,7 +251,7 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
     // down with it. This is a known, documented limitation, not an
     // oversight.
     let (tx, rx) = mpsc::channel();
-    let ast_source = source.clone();
+    let ast = relatorio.ast;
     let handle = std::thread::spawn(move || {
         // ARGS is a scope CONSTANT (not a global var) so a script can't
         // shadow-assign it by accident and then read stale values.
@@ -220,7 +259,7 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
             script_args.into_iter().map(rhai::Dynamic::from).collect();
         let mut scope = rhai::Scope::new();
         scope.push_constant("ARGS", args_array);
-        let result = engine.eval_with_scope::<rhai::Dynamic>(&mut scope, &ast_source);
+        let result = engine.eval_ast_with_scope::<rhai::Dynamic>(&mut scope, &ast);
         let _ = tx.send(result);
     });
 
@@ -251,7 +290,10 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
                 return Ok(124);
             }
             eprintln!("codemode: script error: {e}");
-            for hint in foreign_idiom_hints(&source) {
+            if let Some(t) = preflight::excerpt(&source, e.position()) {
+                eprint!("{t}");
+            }
+            for hint in preflight::foreign_idiom_hints(&source) {
                 eprintln!("codemode: dica: {hint}");
             }
             print_sink(&sink);
@@ -272,6 +314,35 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
     print_sink(&sink);
     record_run(&meta, &counter, &sink, 0, started);
     Ok(0)
+}
+
+/// `codemode check`: pré-voo sem execução. Existe para o CI de um repo
+/// poder validar a própria biblioteca `.codemode/` (#16).
+fn check(script_arg: &str, workdir: &Path) -> Result<i32, String> {
+    let (source, _origem) = read_script(script_arg, workdir)?;
+    let sandbox = Sandbox::new(workdir)?;
+    let mut engine = Engine::new();
+    primitives::register(&mut engine, sandbox, Vec::new(), primitives::new_counter());
+    maestri::register(&mut engine);
+    match preflight::check(&engine, &source) {
+        Ok(r) => {
+            for w in &r.warnings {
+                eprintln!("codemode: dica: {w}");
+            }
+            println!(
+                "ok: {script_arg} compila, {} primitiva(s) referenciada(s){}",
+                r.prim_calls,
+                if r.has_loop { ", com laço" } else { "" }
+            );
+            Ok(0)
+        }
+        Err(erros) => {
+            for e in &erros {
+                eprintln!("codemode: {e}");
+            }
+            Ok(1)
+        }
+    }
 }
 
 /// O que a telemetria sabe da execução antes dela terminar.
@@ -319,66 +390,6 @@ fn record_run(
 /// this machine, none of them were present in the environment. Absence
 /// is not evidence of absence. This value is never used to relax
 /// codemode's own confinement or denylist; those always run regardless.
-/// Targeted hints appended to a script error when the source shows an
-/// idiom from another language. Models writing Rhai (a niche language)
-/// reach for JS/Rust muscle memory; a bare "Variable not found: console"
-/// costs the caller a whole extra LLM round-trip to re-diagnose, while one
-/// hint line usually fixes it on the first retry. Only fires on failure --
-/// zero cost on the success path -- and only for idioms actually present.
-fn foreign_idiom_hints(source: &str) -> Vec<&'static str> {
-    const HINTS: &[(&str, &str)] = &[
-        ("console.", "Rhai não tem console — use print(x)"),
-        ("println!", "Rhai não é Rust — use print(x), sem macros"),
-        ("format!", "Rhai não tem format! — use interpolação `texto ${x}` ou concatenação +"),
-        ("function ", "funções em Rhai usam fn nome() { }, não function"),
-        ("=>", "closure em Rhai é |x| expr, não arrow function =>"),
-        ("===", "Rhai usa == e !=, não === / !=="),
-        ("require(", "Rhai não tem require/import — só as funções nativas do codemode (read_file, run_shell, ...)"),
-        ("import ", "Rhai não tem import — só as funções nativas do codemode"),
-        ("JSON.", "Rhai não tem objeto JSON — trate o texto com as funções de string ou run_shell"),
-        (".forEach", "Rhai não tem forEach — use for x in lista { }"),
-        ("let mut ", "Rhai não usa mut — toda variável let já é mutável"),
-    ];
-    HINTS
-        .iter()
-        .filter(|(pat, _)| source.contains(pat))
-        .map(|(_, hint)| *hint)
-        .take(3)
-        .collect()
-}
-
-/// Warns about assigning the result of a Rhai method that mutates in place
-/// and returns unit. Unlike `foreign_idiom_hints`, this runs BEFORE the
-/// script and on the SUCCESS path too -- the 2026-08-19 incident that wiped
-/// 70 files never errored, so a failure-only hint would never have fired.
-fn mutating_method_warnings(source: &str) -> Vec<String> {
-    const MUTATORS: &[&str] = &["replace", "push", "pad", "crop", "truncate", "remove", "reverse"];
-    let re_ok = |line: &str| line.trim_start().starts_with("//");
-    let mut out = Vec::new();
-    for (i, line) in source.lines().enumerate() {
-        if re_ok(line) {
-            continue;
-        }
-        for m in MUTATORS {
-            let needle = format!(".{m}(");
-            if let Some(at) = line.find(&needle) {
-                let before = &line[..at];
-                let assigns = before.contains('=') && !before.contains("==") && !before.contains("!=");
-                if assigns {
-                    out.push(format!(
-                        "linha {}: `{}` MUTA em lugar e devolve () — atribuir isso dá unit, não string. \
-                         Para `replace`, use replaced(s, velho, novo); para os outros, mute a variável e use ela mesma.",
-                        i + 1,
-                        m
-                    ));
-                }
-            }
-        }
-    }
-    out.truncate(3);
-    out
-}
-
 fn detect_host_sandbox() -> Option<String> {
     for var in ["CLAUDE_SANDBOX", "CODEX_SANDBOX", "SANDBOX", "IS_SANDBOX"] {
         if let Ok(v) = std::env::var(var) {

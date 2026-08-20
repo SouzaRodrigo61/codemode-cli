@@ -207,6 +207,30 @@ one actually seen in real production review scripts).
   the sandbox before being returned, so results are always paths
   `read_file`/`write_file`/`edit_file` accept.
 
+## Pre-flight: the script is checked before anything runs
+
+`codemode run` compiles the script, resolves **every function it calls**
+against what is actually registered, and lints it — all before the first
+primitive executes. A `Function not found: join` on line 8 used to surface
+only after five `run_shell` calls had already run; now it costs ~5ms and
+zero side effects.
+
+```
+codemode check script.rhai      # same pre-flight, never executes
+codemode run script.rhai --dry-run   # announces every write/edit/shell, performs none
+```
+
+Three things fail the pre-flight:
+
+- **an unknown function** — with the closest registered name suggested
+- **a syntax error** — printed with the offending line and a caret under the column
+- **assigning a mutating method** (`let t = s.trim()`) — these return unit in
+  Rhai, and that exact shape wiped 70 files on 2026-08-19 without ever
+  erroring. `replaced(s, old, new)` and `trimmed(s)` are the non-mutating forms.
+
+Idioms from other languages (`=>`, `console.`, `format!`) print a hint
+rather than failing: a false positive there would cost more than it saves.
+
 ## Known traps
 
 Paid for already — don't rediscover them:
