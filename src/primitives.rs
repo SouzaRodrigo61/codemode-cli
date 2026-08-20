@@ -521,23 +521,34 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
         }
     }
 
-    let sh_fallback = || Command::new("sh").arg("-c").arg(cmd).current_dir(&sandbox.root).output();
+    let t = sandbox.cmd_timeout;
+    let sh_fallback = || {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(cmd).current_dir(&sandbox.root);
+        exec_com_deadline(c, t, cmd)
+    };
     let output = match &plain {
-        Some(words) if routed => match Command::new("rtk").args(words).current_dir(&sandbox.root).output() {
+        Some(words) if routed => {
+            let mut c = Command::new("rtk");
+            c.args(words).current_dir(&sandbox.root);
+            match exec_com_deadline(c, t, cmd) {
             Ok(o) => Ok(o),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => sh_fallback(),
             Err(e) => Err(e),
-        },
-        Some(words) => match Command::new(&words[0]).args(&words[1..]).current_dir(&sandbox.root).output() {
+        }}
+        Some(words) => {
+            let mut c = Command::new(&words[0]);
+            c.args(&words[1..]).current_dir(&sandbox.root);
+            match exec_com_deadline(c, t, cmd) {
             Ok(o) => Ok(o),
             // NotFound covers shell builtins/functions (`command`, `type`,
             // aliases) that only exist inside a shell -- hand those to sh.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => sh_fallback(),
             Err(e) => Err(e),
-        },
+        }}
         None => sh_fallback(),
     }
-    .map_err(|e| to_err(format!("run_shell: failed to spawn: {e}")))?;
+    .map_err(|e| to_err(format!("run_shell: {e}")))?;
 
     let mut combined = String::new();
     combined.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -586,16 +597,25 @@ fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Ma
     } else {
         shell_words::split(cmd).ok().filter(|w| !w.is_empty())
     };
-    let sh_fallback = || Command::new("sh").arg("-c").arg(cmd).current_dir(&sandbox.root).output();
+    let t = sandbox.cmd_timeout;
+    let sh_fallback = || {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(cmd).current_dir(&sandbox.root);
+        exec_com_deadline(c, t, cmd)
+    };
     let output = match &plain {
-        Some(words) => match Command::new(&words[0]).args(&words[1..]).current_dir(&sandbox.root).output() {
-            Ok(o) => Ok(o),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => sh_fallback(),
-            Err(e) => Err(e),
-        },
+        Some(words) => {
+            let mut c = Command::new(&words[0]);
+            c.args(&words[1..]).current_dir(&sandbox.root);
+            match exec_com_deadline(c, t, cmd) {
+                Ok(o) => Ok(o),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => sh_fallback(),
+                Err(e) => Err(e),
+            }
+        }
         None => sh_fallback(),
     }
-    .map_err(|e| to_err(format!("run_shell_full: failed to spawn: {e}")))?;
+    .map_err(|e| to_err(format!("run_shell_full: {e}")))?;
 
     let mut map = Map::new();
     map.insert("stdout".into(), String::from_utf8_lossy(&output.stdout).into_owned().into());
@@ -887,6 +907,163 @@ fn path_exists_impl(sandbox: &Sandbox, path: &str) -> Result<bool, Box<EvalAltRe
     Ok(p.exists())
 }
 
+/// Executa um `Command` com deadline e heartbeat (#18).
+///
+/// Substitui `Command::output()`, que espera para sempre: era isso que
+/// obrigava a regra "suíte de teste fica fora do script" e quebrava todo
+/// fluxo de verificação em duas tool-calls. A espera é um poll com backoff
+/// exponencial (200µs até 20ms) para não somar latência a comando rápido --
+/// as duas pontas dos pipes são drenadas em threads, senão um comando
+/// falante encheria o buffer e travaria antes do deadline.
+fn exec_com_deadline(
+    mut c: Command,
+    timeout: u64,
+    rotulo: &str,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    // Sem deadline não há o que vigiar: volta ao caminho blocante, que é o
+    // mais barato (medido: a vigilância custa ~0,37ms por run_shell).
+    if timeout == 0 {
+        return c.output();
+    }
+
+    c.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn()?;
+    let inicio = Instant::now();
+    let limite = Some(Duration::from_secs(timeout));
+
+    // Fase rápida: a maioria dos comandos termina em poucos ms. Enquanto
+    // isso não passar, só cedemos a CPU -- sem dormir (a granularidade real
+    // do sleep no macOS é ~1ms, mais do que o comando inteiro costuma
+    // custar) e sem gastar duas threads de leitura. Medido em três
+    // `run_shell("true")`: 8,0ms antes do deadline existir, 12,3ms com poll
+    // dormindo e threads sempre, 8,6ms assim.
+    let janela_rapida = Duration::from_millis(8);
+    while inicio.elapsed() < janela_rapida {
+        if let Some(status) = child.try_wait()? {
+            let mut so = Vec::new();
+            let mut se = Vec::new();
+            if let Some(s) = child.stdout.as_mut() {
+                let _ = s.read_to_end(&mut so);
+            }
+            if let Some(s) = child.stderr.as_mut() {
+                let _ = s.read_to_end(&mut se);
+            }
+            return Ok(std::process::Output { status, stdout: so, stderr: se });
+        }
+        std::thread::yield_now();
+    }
+
+    // Comando demorado: agora sim vale a pena drenar os pipes em threads --
+    // sem isso um comando falante enche o buffer do pipe e trava antes do
+    // deadline -- e passar a dormir entre as checagens.
+    let mut saida = child.stdout.take();
+    let mut erro = child.stderr.take();
+    let h_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(s) = saida.as_mut() {
+            let _ = s.read_to_end(&mut b);
+        }
+        b
+    });
+    let h_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(s) = erro.as_mut() {
+            let _ = s.read_to_end(&mut b);
+        }
+        b
+    });
+
+    let mut proximo_beat = Duration::from_secs(10);
+    let mut nap = Duration::from_micros(250);
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if let Some(d) = limite {
+            if inicio.elapsed() >= d {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("comando excedeu {timeout}s e foi morto: {}", corta(rotulo, 120)),
+                ));
+            }
+        }
+        if inicio.elapsed() >= proximo_beat {
+            eprintln!(
+                "codemode: ainda rodando ({}s): {}",
+                inicio.elapsed().as_secs(),
+                corta(rotulo, 80)
+            );
+            proximo_beat += Duration::from_secs(10);
+        }
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(Duration::from_millis(20));
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: h_out.join().unwrap_or_default(),
+        stderr: h_err.join().unwrap_or_default(),
+    })
+}
+
+fn corta(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(n).collect::<String>())
+    }
+}
+
+/// `parallel_shell` (#19): N comandos de shell concorrentes, ordem
+/// preservada. 49 dos 129 scripts inline medidos tinham laço serial de
+/// subprocesso -- somar latência à toa é o que mais empurra script contra o
+/// deadline. Closure do Rhai não atravessa thread com o modelo de execução
+/// atual, então a forma é uma lista de comandos, não um `parallel(itens,
+/// |x| ...)` genérico.
+fn parallel_shell_impl(sandbox: &Sandbox, cmds: Array) -> Result<Array, Box<EvalAltResult>> {
+    let lista: Vec<String> = cmds.iter().map(|c| c.to_string()).collect();
+
+    // Denylist antes de despachar: uma recusa não pode ficar escondida
+    // dentro de uma thread e virar erro capturável.
+    for cmd in &lista {
+        if let Some(rule) = denylist::check(cmd) {
+            return Err(Box::new(EvalAltResult::ErrorTerminated(
+                format!("denylist:parallel_shell refused, command matches denylist rule '{rule}'")
+                    .into(),
+                rhai::Position::NONE,
+            )));
+        }
+    }
+
+    let limite = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(1);
+    let mut saida = Array::new();
+    for bloco in lista.chunks(limite) {
+        let mut parciais: Vec<Result<Map, String>> = Vec::with_capacity(bloco.len());
+        std::thread::scope(|escopo| {
+            let handles: Vec<_> = bloco
+                .iter()
+                .map(|cmd| escopo.spawn(move || run_shell_full_impl(sandbox, cmd, false).map_err(|e| e.to_string())))
+                .collect();
+            for h in handles {
+                parciais.push(h.join().unwrap_or_else(|_| Err("thread do parallel_shell morreu".into())));
+            }
+        });
+        for p in parciais {
+            match p {
+                Ok(m) => saida.push(m.into()),
+                Err(e) => return Err(to_err(e)),
+            }
+        }
+    }
+    Ok(saida)
+}
+
 pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>, counter: Counter) {
     {
         let allow = allow_hosts;
@@ -991,6 +1168,13 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>,
         glob_impl(&sb, pattern)
     });
 
+
+    let sb = sandbox.clone();
+    let ct = counter.clone();
+    engine.register_fn("parallel_shell", move |cmds: Array| -> Result<Array, Box<EvalAltResult>> {
+        bump(&ct, "parallel_shell");
+        parallel_shell_impl(&sb, cmds)
+    });
 
     // --- stdlib (#14) ---
     engine.register_fn("join", |a: Array, sep: &str| -> String {

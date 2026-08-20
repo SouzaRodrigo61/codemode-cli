@@ -31,9 +31,25 @@ enum Commands {
         /// Directory the script is confined to. Defaults to the current directory.
         #[arg(long, default_value = ".")]
         workdir: PathBuf,
-        /// Wall-clock timeout in seconds. Hard cap: 120s.
+        /// Wall-clock timeout for the whole script, in seconds. 0 disables
+        /// it -- the caller takes responsibility. A pure VM loop is still
+        /// caught by --vm-idle, which is independent of this.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
+        /// Seconds a single shell command may run before being killed.
+        /// 0 disables. This is what makes `cargo test` inside a script
+        /// possible without the whole run hanging forever.
+        #[arg(long = "cmd-timeout", default_value_t = 600)]
+        cmd_timeout: u64,
+        /// Abort if this many seconds pass without a single primitive being
+        /// dispatched -- the guard against `loop {}`, independent of how
+        /// long the script as a whole is allowed to take.
+        #[arg(long = "vm-idle", default_value_t = 30)]
+        vm_idle: u64,
+        /// Additional directory the script may read and write (repeatable).
+        /// Each root is confined on its own; there is no path between them.
+        #[arg(long = "extra-root")]
+        extra_root: Vec<PathBuf>,
         /// Max bytes of consolidated output before truncation.
         #[arg(long = "max-output", default_value_t = 1_048_576)]
         max_output: usize,
@@ -103,7 +119,6 @@ enum Commands {
     },
 }
 
-const HARD_TIMEOUT_CAP: u64 = 120;
 
 fn main() {
     let cli = Cli::parse();
@@ -115,9 +130,21 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Commands::Run { script, workdir, timeout, max_output, verbose, dry_run, allow_host, script_args } => {
-            let timeout = timeout.clamp(1, HARD_TIMEOUT_CAP);
-            match run(&script, &workdir, timeout, max_output, verbose, dry_run, allow_host, script_args) {
+        Commands::Run {
+            script,
+            workdir,
+            timeout,
+            cmd_timeout,
+            vm_idle,
+            extra_root,
+            max_output,
+            verbose,
+            dry_run,
+            allow_host,
+            script_args,
+        } => {
+            let opts = RunOpts { timeout, cmd_timeout, vm_idle, extra_root, max_output, verbose, dry_run, allow_hosts: allow_host };
+            match run(&script, &workdir, opts, script_args) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("codemode: {e}");
@@ -180,8 +207,21 @@ fn read_script(script: &str, workdir: &Path) -> Result<(String, &'static str), S
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize, verbose: bool, dry_run: bool, allow_hosts: Vec<String>, script_args: Vec<String>) -> Result<i32, String> {
+/// Opções de uma execução. Viraram struct quando `run` passou de 8
+/// parâmetros -- e porque #18 acrescentou três de uma vez.
+struct RunOpts {
+    timeout: u64,
+    cmd_timeout: u64,
+    vm_idle: u64,
+    extra_root: Vec<PathBuf>,
+    max_output: usize,
+    verbose: bool,
+    dry_run: bool,
+    allow_hosts: Vec<String>,
+}
+
+fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>) -> Result<i32, String> {
+    let RunOpts { timeout: timeout_secs, cmd_timeout, vm_idle, extra_root, max_output, verbose, dry_run, allow_hosts } = opts;
     let started = Instant::now();
     let (source, origem) = read_script(script_arg, workdir)?;
     let counter = primitives::new_counter();
@@ -190,12 +230,15 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
         source: origem.to_string(),
         name: if origem == "stdin" { None } else { Some(script_arg.to_string()) },
         workdir: std::fs::canonicalize(workdir)
-            .unwrap_or_else(|_| workdir.clone())
+            .unwrap_or_else(|_| workdir.to_path_buf())
             .display()
             .to_string(),
     };
 
-    let sandbox = Sandbox::new(workdir)?.with_dry(dry_run);
+    let sandbox = Sandbox::new(workdir)?
+        .with_dry(dry_run)
+        .with_cmd_timeout(cmd_timeout)
+        .with_extra_roots(&extra_root)?;
 
     let mut engine = Engine::new();
     primitives::register(&mut engine, sandbox, allow_hosts, counter.clone());
@@ -223,24 +266,48 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
     }
 
     if verbose {
-        eprintln!("codemode: workdir={:?} timeout={}s max_output={}B", std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.clone()), timeout_secs, max_output);
+        eprintln!("codemode: workdir={:?} timeout={}s max_output={}B", std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf()), timeout_secs, max_output);
         match detect_host_sandbox() {
             Some(v) => eprintln!("codemode: host sandbox signal detected: {v} (informational only, best-effort — codemode's own confinement/denylist run unconditionally either way)"),
             None => eprintln!("codemode: no known host sandbox env var detected (informational only, best-effort — absence doesn't mean no sandbox; codemode's own confinement/denylist run unconditionally either way)"),
         }
     }
 
-    // Primary defense against pure-VM infinite loops (e.g. `loop {}`):
-    // Rhai calls this progress hook roughly once per VM operation, so we
-    // can abort cleanly by returning Some(..) once the deadline passes.
+    // Duas guardas independentes, porque são dois problemas diferentes
+    // (#18):
+    //
+    // 1. Deadline global (`--timeout`, 0 = desligado): o script como um
+    //    todo. Deixou de ter cap de 120s -- um script que edita, roda a
+    //    suíte e decide pelo resultado precisa de minutos, e proibir isso
+    //    era o que quebrava todo fluxo de verificação em duas tool-calls.
+    // 2. Ociosidade de VM (`--vm-idle`): tempo sem NENHUMA primitiva
+    //    despachada. É o que pega `loop {}`, e continua valendo mesmo com
+    //    --timeout 0, porque laço puro não chama primitiva nenhuma. O sinal
+    //    vem do contador de telemetria, que já existe.
     let start = Instant::now();
-    let deadline = Duration::from_secs(timeout_secs);
+    let deadline = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+    let ociosidade = Duration::from_secs(vm_idle.max(1));
+    let vigia = counter.clone();
+    let ultimo_total = std::sync::atomic::AtomicU64::new(0);
+    let ultimo_ms = std::sync::atomic::AtomicU64::new(0);
     engine.on_progress(move |_ops| {
-        if start.elapsed() >= deadline {
-            Some(rhai::Dynamic::from("codemode: script exceeded timeout".to_string()))
-        } else {
-            None
+        use std::sync::atomic::Ordering;
+        let agora = start.elapsed();
+        let total: u64 = vigia.lock().map(|m| m.values().sum()).unwrap_or(0);
+        if total != ultimo_total.load(Ordering::Relaxed) {
+            ultimo_total.store(total, Ordering::Relaxed);
+            ultimo_ms.store(agora.as_millis() as u64, Ordering::Relaxed);
         }
+        if let Some(d) = deadline {
+            if agora >= d {
+                return Some(rhai::Dynamic::from("codemode: script exceeded timeout".to_string()));
+            }
+        }
+        let parado = agora.saturating_sub(Duration::from_millis(ultimo_ms.load(Ordering::Relaxed)));
+        if parado >= ociosidade {
+            return Some(rhai::Dynamic::from("codemode: script exceeded timeout".to_string()));
+        }
+        None
     });
 
     // Backup watchdog: on_progress only fires between VM operations, so it
@@ -263,7 +330,13 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
         let _ = tx.send(result);
     });
 
-    match rx.recv_timeout(deadline + Duration::from_secs(1)) {
+    let recebido = match deadline {
+        Some(d) => rx.recv_timeout(d + Duration::from_secs(1)).map_err(|_| ()),
+        // Sem deadline global o watchdog de processo não se aplica: quem
+        // protege é a guarda de ociosidade, que aborta o script por dentro.
+        None => rx.recv().map_err(|_| ()),
+    };
+    match recebido {
         Ok(Ok(value)) => {
             if !value.is_unit() {
                 let mut s = sink.lock().unwrap();
@@ -285,7 +358,9 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
                     record_run(&meta, &counter, &sink, 1, started);
                     return Ok(1);
                 }
-                eprintln!("codemode: script exceeded {timeout_secs}s timeout, aborted");
+                eprintln!(
+                    "codemode: script abortado -- estourou o limite (timeout={timeout_secs}s, vm-idle={vm_idle}s)"
+                );
                 record_run(&meta, &counter, &sink, 124, started);
                 return Ok(124);
             }
@@ -300,7 +375,7 @@ fn run(script_arg: &str, workdir: &PathBuf, timeout_secs: u64, max_output: usize
             record_run(&meta, &counter, &sink, 1, started);
             return Ok(1);
         }
-        Err(_) => {
+        Err(()) => {
             // Watchdog fallback: still not done past the hard deadline.
             // The eval thread may be stuck in a blocking native call; we
             // cannot safely join/kill it, so exit the whole process.
