@@ -73,10 +73,8 @@ impl Sandbox {
                 }
                 return Some(out);
             }
-            match existente.file_name() {
-                Some(n) => resto.push(n.to_os_string()),
-                None => return None,
-            }
+            let nome = existente.file_name()?;
+            resto.push(nome.to_os_string());
             if !existente.pop() {
                 return None;
             }
