@@ -231,6 +231,34 @@ Three things fail the pre-flight:
 Idioms from other languages (`=>`, `console.`, `format!`) print a hint
 rather than failing: a false positive there would cost more than it saves.
 
+## Long commands, loops, and more than one repo
+
+A script may now do the thing the old 120s cap forbade: **edit, run the
+suite, and decide by the result** — in one call.
+
+```
+codemode run verify.rhai --timeout 0        # no wall-clock limit on the script
+codemode run verify.rhai --cmd-timeout 900  # but no single command may exceed 15min
+codemode run x.rhai --extra-root ../other-repo   # a second confined root
+```
+
+Three independent guards, because they are three different failures:
+
+| Flag | Guards against | Default |
+|---|---|---|
+| `--timeout` | the whole script running away; `0` disables | 30s |
+| `--cmd-timeout` | one shell command hanging forever; `0` uses the plain blocking wait | 600s |
+| `--vm-idle` | `loop {}` — time with **no primitive dispatched at all**, so it still fires under `--timeout 0` | 30s |
+
+A command running longer than 10s prints a heartbeat to stderr. Watching a
+command costs ~0.37ms per `run_shell` versus the old blocking wait; pass
+`--cmd-timeout 0` to opt out.
+
+`parallel_shell(["cmd a", "cmd b", ...])` runs commands concurrently, capped
+at the machine's parallelism, and returns the `run_shell_full` maps **in
+order**. The denylist is checked before anything is dispatched, so a refusal
+can never hide inside a thread.
+
 ## Known traps
 
 Paid for already — don't rediscover them:
