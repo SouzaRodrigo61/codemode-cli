@@ -449,6 +449,30 @@ fn try_in_process_filter(words: &[String], sandbox: &Sandbox) -> Option<Result<S
 /// `bump_version.rhai`'s tiny `grep -c` verification regressed 7.5ms ->
 /// 13.9ms the day grep entered RTK_WORTH_ROUTING. Mirrors rtk's own flag
 /// list; short flags are scanned per-letter so clusters like `-rlc` count.
+/// Formas cujo roteamento pelo RTK so cobra e nao entrega (#32).
+///
+/// Medido: comando roteado sem filtro in-process paga **+2,8ms** pelo spawn
+/// do binario `rtk`. Faz sentido quando a saida e grande e o filtro corta
+/// muito -- `cargo test`, `git diff`. Nao faz sentido nestes dois casos:
+///
+/// 1. **Saida ja minima**: `git rev-parse HEAD` sao 40 caracteres. Nao ha
+///    o que comprimir, so o que pagar.
+/// 2. **Saida legivel por maquina**: `gh ... --json ... --jq ...` devolve
+///    JSON que o script vai parsear. Passar isso por um filtro de texto e,
+///    na melhor hipotese, inutil.
+fn saida_ja_e_minima(words: &[String]) -> bool {
+    let tem = |flag: &str| words.iter().any(|w| w == flag);
+    if tem("--json") || tem("--jq") || tem("--oneline") || tem("--porcelain") || tem("--quiet") {
+        return true;
+    }
+    let sub = words.get(1).map(|s| s.as_str()).unwrap_or("");
+    matches!(words[0].as_str(), "git")
+        && matches!(
+            sub,
+            "rev-parse" | "config" | "symbolic-ref" | "remote" | "worktree" | "check-ignore"
+        )
+}
+
 fn grep_shape_rtk_would_passthrough(words: &[String]) -> bool {
     if words.first().map(|w| w.as_str()) != Some("grep") {
         return false;
@@ -624,6 +648,217 @@ fn listar(sandbox: &Sandbox, dir: &str) -> Option<Result<String, Box<EvalAltResu
     Some(Ok(nomes.into_iter().map(|n| format!("{n}\n")).collect()))
 }
 
+
+// ---------------------------------------------------------------------------
+// Pipeline sem `sh` (#30)
+//
+// Medido: `run_shell("sh -c 'cat a.txt'")` custa 4,55ms contra 1,66ms do
+// spawn direto -- o `sh` intermediario e 3x o custo do comando. E 20% dos
+// comandos reais tem metachar; destes, 63 de 85 sao pipe.
+//
+// A regra e a mesma do caminho nativo: so o subconjunto que da pra executar
+// com semantica IDENTICA. Qualquer sinal de shell de verdade -- expansao,
+// subshell, glob, `;`, `&&`, variavel -- devolve None e vai pro `sh`, que
+// e quem sabe fazer aquilo direito.
+// ---------------------------------------------------------------------------
+
+/// Sinais de que so o shell resolve: presentes, nem tentamos.
+const SO_O_SHELL_RESOLVE: &[char] =
+    &['$', '`', ';', '(', ')', '<', '*', '?', '[', ']', '{', '}', '~', '\\', '\n'];
+
+struct Pipeline {
+    etapas: Vec<Vec<String>>,
+    /// (caminho, append) do `>` ou `>>` final.
+    redireciona: Option<(String, bool)>,
+    /// `2>&1` na ultima etapa: junta stderr no stdout.
+    junta_stderr: bool,
+}
+
+fn parse_pipeline(cmd: &str) -> Option<Pipeline> {
+    let mut resto = cmd.trim().to_string();
+    let junta_stderr = resto.contains("2>&1");
+    if junta_stderr {
+        resto = resto.replace("2>&1", " ");
+    }
+    if resto.contains("&&") || resto.contains("||") || resto.contains('&') {
+        return None;
+    }
+    if resto.chars().any(|c| SO_O_SHELL_RESOLVE.contains(&c)) {
+        return None;
+    }
+
+    let mut redireciona = None;
+    if let Some(pos) = resto.rfind('>') {
+        let append = pos > 0 && resto.as_bytes()[pos - 1] == b'>';
+        let inicio = if append { pos - 1 } else { pos };
+        let alvo = resto[pos + 1..].trim().to_string();
+        if alvo.is_empty() || alvo.contains('>') || alvo.split_whitespace().count() != 1 {
+            return None;
+        }
+        redireciona = Some((alvo, append));
+        resto.truncate(inicio);
+    }
+    if resto.contains('>') {
+        return None;
+    }
+
+    let mut etapas = Vec::new();
+    for pedaco in resto.split('|') {
+        let palavras = shell_words::split(pedaco).ok()?;
+        if palavras.is_empty() {
+            return None;
+        }
+        etapas.push(palavras);
+    }
+    if etapas.is_empty() || (etapas.len() == 1 && redireciona.is_none()) {
+        return None;
+    }
+    Some(Pipeline { etapas, redireciona, junta_stderr })
+}
+
+/// Etapa que consome stdin e da pra fazer em memoria -- o padrao real e
+/// `algo | head -20`, `algo | wc -l`, `algo | sort`.
+fn filtro_em_memoria(palavras: &[String], entrada: &str) -> Option<String> {
+    let p: Vec<&str> = palavras.iter().map(|s| s.as_str()).collect();
+    match p.as_slice() {
+        ["cat"] => Some(entrada.to_string()),
+        ["head"] => Some(entrada.lines().take(10).map(|l| format!("{l}\n")).collect()),
+        ["head", "-n", n] => {
+            let limite: usize = n.parse().ok()?;
+            Some(entrada.lines().take(limite).map(|l| format!("{l}\n")).collect())
+        }
+        ["tail", "-n", n] => {
+            let limite: usize = n.parse().ok()?;
+            let linhas: Vec<&str> = entrada.lines().collect();
+            let inicio = linhas.len().saturating_sub(limite);
+            Some(linhas[inicio..].iter().map(|l| format!("{l}\n")).collect())
+        }
+        ["wc", "-l"] => Some(format!("{}\n", entrada.lines().count())),
+        ["wc", "-c"] => Some(format!("{}\n", entrada.len())),
+        ["sort"] => {
+            let mut linhas: Vec<&str> = entrada.lines().collect();
+            linhas.sort_unstable();
+            Some(linhas.iter().map(|l| format!("{l}\n")).collect())
+        }
+        ["sort", "-u"] => {
+            let mut linhas: Vec<&str> = entrada.lines().collect();
+            linhas.sort_unstable();
+            linhas.dedup();
+            Some(linhas.iter().map(|l| format!("{l}\n")).collect())
+        }
+        ["uniq"] => {
+            let mut saida = String::new();
+            let mut anterior: Option<&str> = None;
+            for l in entrada.lines() {
+                if Some(l) != anterior {
+                    saida.push_str(l);
+                    saida.push('\n');
+                }
+                anterior = Some(l);
+            }
+            Some(saida)
+        }
+        ["grep", padrao] => {
+            Some(entrada.lines().filter(|l| l.contains(padrao)).map(|l| format!("{l}\n")).collect())
+        }
+        ["grep", "-v", padrao] => {
+            Some(entrada.lines().filter(|l| !l.contains(padrao)).map(|l| format!("{l}\n")).collect())
+        }
+        ["grep", "-c", padrao] => {
+            Some(format!("{}\n", entrada.lines().filter(|l| l.contains(padrao)).count()))
+        }
+        _ => None,
+    }
+}
+
+fn roda_etapa_com_entrada(
+    palavras: &[String],
+    entrada: &str,
+    sandbox: &Sandbox,
+    junta_stderr: bool,
+) -> Option<String> {
+    if let Some(saida) = filtro_em_memoria(palavras, entrada) {
+        return Some(saida);
+    }
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut c = Command::new(&palavras[0]);
+    c.args(&palavras[1..])
+        .current_dir(&sandbox.root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(if junta_stderr { Stdio::piped() } else { Stdio::null() });
+    let mut filho = c.spawn().ok()?;
+    if let Some(mut stdin) = filho.stdin.take() {
+        let dados = entrada.as_bytes().to_vec();
+        // Escreve numa thread: pipeline com muita entrada trava se o
+        // processo comecar a escrever antes de a gente terminar de mandar.
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&dados);
+        });
+    }
+    let saida = filho.wait_with_output().ok()?;
+    let mut texto = String::from_utf8_lossy(&saida.stdout).to_string();
+    if junta_stderr {
+        texto.push_str(&String::from_utf8_lossy(&saida.stderr));
+    }
+    Some(texto)
+}
+
+fn tenta_pipeline(cmd: &str, sandbox: &Sandbox) -> Option<Result<String, Box<EvalAltResult>>> {
+    let pipeline = parse_pipeline(cmd)?;
+    // Denylist vale por etapa: um `rm -rf /` no meio do pipe e um `rm -rf /`.
+    for etapa in &pipeline.etapas {
+        if let Some(rule) = denylist::check(&etapa.join(" ")) {
+            return Some(Err(Box::new(EvalAltResult::ErrorTerminated(
+                format!("denylist:run_shell refused, command matches denylist rule '{rule}'").into(),
+                rhai::Position::NONE,
+            ))));
+        }
+    }
+
+    let mut atual = String::new();
+    for (i, etapa) in pipeline.etapas.iter().enumerate() {
+        let ultima = i == pipeline.etapas.len() - 1;
+        let junta = pipeline.junta_stderr && ultima;
+        if i == 0 {
+            atual = match try_comando_nativo(etapa, sandbox) {
+                Some(Ok(saida)) => saida,
+                Some(Err(e)) => return Some(Err(e)),
+                None => {
+                    let mut c = Command::new(&etapa[0]);
+                    c.args(&etapa[1..]).current_dir(&sandbox.root);
+                    let saida = exec_com_deadline(c, sandbox.cmd_timeout, cmd).ok()?;
+                    let mut texto = String::from_utf8_lossy(&saida.stdout).to_string();
+                    if junta {
+                        texto.push_str(&String::from_utf8_lossy(&saida.stderr));
+                    }
+                    texto
+                }
+            };
+        } else {
+            atual = roda_etapa_com_entrada(etapa, &atual, sandbox, junta)?;
+        }
+    }
+
+    if let Some((destino, append)) = pipeline.redireciona {
+        let alvo = sandbox.resolve(&destino).ok()?;
+        let escrita = if append {
+            fs::OpenOptions::new().create(true).append(true).open(&alvo).and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(atual.as_bytes())
+            })
+        } else {
+            fs::write(&alvo, atual.as_bytes())
+        };
+        return match escrita {
+            Ok(()) => Some(Ok(String::new())),
+            Err(_) => None,
+        };
+    }
+    Some(Ok(atual))
+}
+
 fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String, Box<EvalAltResult>> {
     if sandbox.dry {
         eprintln!("codemode: [dry-run] run_shell({cmd:?})");
@@ -672,6 +907,15 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
     // a 4.8ms noop baseline). Now they spawn the target directly, with
     // `sh -c` kept only as the fallback for shell syntax, shell builtins,
     // and anything the direct spawn can't find.
+    // Pipeline simples e redirecionamento resolvidos sem o `sh` no meio
+    // (#30). Qualquer coisa fora do subconjunto seguro devolve None aqui e
+    // segue o caminho de sempre.
+    if !sandbox.dry {
+        if let Some(resultado) = tenta_pipeline(cmd, sandbox) {
+            return resultado;
+        }
+    }
+
     let plain = if SHELL_METACHARS.iter().any(|c| cmd.contains(*c)) {
         None
     } else {
@@ -680,6 +924,7 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
     let routed = plain.as_ref().is_some_and(|w| {
         w.first().map(|first| RTK_WORTH_ROUTING.contains(&first.as_str())).unwrap_or(false)
             && !grep_shape_rtk_would_passthrough(w)
+            && !saida_ja_e_minima(w)
     });
 
     // Antes de qualquer spawn: o comando trivial resolvido aqui dentro custa

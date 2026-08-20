@@ -293,6 +293,25 @@ something that already exists natively (`cat` → `read_file`, `find` →
 `glob`, `sed -i` → `replace_all_in_glob`), since a primitive returns typed
 data instead of text to re-parse.
 
+## Pipelines run without a shell in the middle
+
+`cat a.txt | sort | head -n 5`, `cmd > file`, `cmd >> file`, `2>&1` — these
+execute directly, and any stage that is a pure text filter (`head`, `tail`,
+`wc -l`, `sort`, `sort -u`, `uniq`, `grep`, `grep -v`, `grep -c`, `cat`)
+runs in memory with no process at all.
+
+Measured: 15 pipelines plus 10 `sh -c` calls, **170 ms → 54 ms** (−68%).
+
+Same rule as everywhere else: anything with a variable, a subshell, a glob,
+`;`, `&&` or `||` goes to `sh`, which is what knows how to do that properly.
+Every covered form has a test comparing against the real shell.
+
+Commands whose output is already minimal or machine-readable
+(`git rev-parse`, `git config`, anything with `--json`/`--jq`/`--porcelain`)
+skip RTK routing: there is nothing for a text filter to compress, and the
+extra process was costing ~15 ms. `git rev-parse HEAD` ten times: **281 ms →
+129 ms**.
+
 ## Known traps
 
 Paid for already — don't rediscover them:
