@@ -147,6 +147,10 @@ fn read_file_impl(sandbox: &Sandbox, path: &str) -> Result<String, Box<EvalAltRe
 // ---- write_file ----
 
 fn write_file_impl(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), Box<EvalAltResult>> {
+    if sandbox.dry {
+        eprintln!("codemode: [dry-run] write_file({path:?}, {} bytes)", content.len());
+        return Ok(());
+    }
     let resolved = sandbox.resolve(path).map_err(to_err)?;
     if let Some(parent) = resolved.parent() {
         fs::create_dir_all(parent).map_err(|e| to_err(format!("write_file: cannot create {:?}: {e}", parent)))?;
@@ -193,6 +197,10 @@ fn write_file_guarded(sandbox: &Sandbox, path: &str, content: &str) -> Result<()
 /// existing can be lost. This is what a `read_file` + `write_file`
 /// "append" loop should have been.
 fn append_file_impl(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), Box<EvalAltResult>> {
+    if sandbox.dry {
+        eprintln!("codemode: [dry-run] append_file({path:?}, {} bytes)", content.len());
+        return Ok(());
+    }
     use std::io::Write as _;
     let resolved = sandbox.resolve(path).map_err(to_err)?;
     if let Some(parent) = resolved.parent() {
@@ -210,6 +218,10 @@ fn append_file_impl(sandbox: &Sandbox, path: &str, content: &str) -> Result<(), 
 // ---- edit_file ----
 
 fn edit_file_impl(sandbox: &Sandbox, path: &str, old: &str, new: &str) -> Result<(), Box<EvalAltResult>> {
+    if sandbox.dry {
+        eprintln!("codemode: [dry-run] edit_file({path:?}, {} -> {} bytes)", old.len(), new.len());
+        return Ok(());
+    }
     if old.is_empty() {
         return Err(to_err("edit_file: `old` must not be empty"));
     }
@@ -444,6 +456,10 @@ fn grep_shape_rtk_would_passthrough(words: &[String]) -> bool {
 }
 
 fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String, Box<EvalAltResult>> {
+    if sandbox.dry {
+        eprintln!("codemode: [dry-run] run_shell({cmd:?})");
+        return Ok(String::new());
+    }
     if let Some(rule) = denylist::check(cmd) {
         if !confirm {
             // ErrorTerminated, not a plain runtime error, on purpose: Rhai
@@ -543,6 +559,16 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
 /// `run_shell_full` (raw, typed). Same denylist gate, same uncatchable
 /// refusal.
 fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Map, Box<EvalAltResult>> {
+    if sandbox.dry {
+        eprintln!("codemode: [dry-run] run_shell_full({cmd:?})");
+        let mut m = Map::new();
+        m.insert("stdout".into(), String::new().into());
+        m.insert("stderr".into(), String::new().into());
+        m.insert("exit_code".into(), 0_i64.into());
+        m.insert("success".into(), true.into());
+        m.insert("dry".into(), true.into());
+        return Ok(m);
+    }
     if let Some(rule) = denylist::check(cmd) {
         if !confirm {
             return Err(Box::new(EvalAltResult::ErrorTerminated(
@@ -797,6 +823,70 @@ fn bump(c: &Counter, nome: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Buraco de stdlib (#14). Cada uma destas saiu de uma falha real
+// `Function not found` -- o custo de não existir é a execução inteira
+// jogada fora mais um round-trip de LLM pra rediagnosticar.
+// ---------------------------------------------------------------------------
+
+fn dyn_to_json(d: &rhai::Dynamic) -> serde_json::Value {
+    use serde_json::Value;
+    if d.is_unit() {
+        return Value::Null;
+    }
+    if let Some(b) = d.clone().try_cast::<bool>() {
+        return Value::Bool(b);
+    }
+    if let Some(i) = d.clone().try_cast::<i64>() {
+        return Value::from(i);
+    }
+    if let Some(f) = d.clone().try_cast::<f64>() {
+        return serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null);
+    }
+    if let Some(s) = d.clone().try_cast::<String>() {
+        return Value::String(s);
+    }
+    if let Some(a) = d.clone().try_cast::<Array>() {
+        return Value::Array(a.iter().map(dyn_to_json).collect());
+    }
+    if let Some(m) = d.clone().try_cast::<Map>() {
+        return Value::Object(m.iter().map(|(k, v)| (k.to_string(), dyn_to_json(v))).collect());
+    }
+    Value::String(d.to_string())
+}
+
+fn json_to_dyn(v: &serde_json::Value) -> rhai::Dynamic {
+    use serde_json::Value;
+    match v {
+        Value::Null => rhai::Dynamic::UNIT,
+        Value::Bool(b) => (*b).into(),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into()
+            } else {
+                n.as_f64().unwrap_or(0.0).into()
+            }
+        }
+        Value::String(s) => s.clone().into(),
+        Value::Array(a) => {
+            let arr: Array = a.iter().map(json_to_dyn).collect();
+            arr.into()
+        }
+        Value::Object(o) => {
+            let mut m = Map::new();
+            for (k, val) in o {
+                m.insert(k.as_str().into(), json_to_dyn(val));
+            }
+            m.into()
+        }
+    }
+}
+
+fn path_exists_impl(sandbox: &Sandbox, path: &str) -> Result<bool, Box<EvalAltResult>> {
+    let p = sandbox.resolve(path).map_err(to_err)?;
+    Ok(p.exists())
+}
+
 pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>, counter: Counter) {
     {
         let allow = allow_hosts;
@@ -899,6 +989,37 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>,
     engine.register_fn("glob", move |pattern: &str| -> Result<Array, Box<EvalAltResult>> {
         bump(&ct, "glob");
         glob_impl(&sb, pattern)
+    });
+
+
+    // --- stdlib (#14) ---
+    engine.register_fn("join", |a: Array, sep: &str| -> String {
+        a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(sep)
+    });
+    engine.register_fn("lines", |s: &str| -> Array {
+        s.lines().map(|l| rhai::Dynamic::from(l.to_string())).collect()
+    });
+    engine.register_fn("trimmed", |s: &str| -> String { s.trim().to_string() });
+    engine.register_fn("to_json", |d: rhai::Dynamic| -> String {
+        serde_json::to_string(&dyn_to_json(&d)).unwrap_or_else(|_| "null".into())
+    });
+    engine.register_fn("from_json", |s: &str| -> Result<rhai::Dynamic, Box<EvalAltResult>> {
+        match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => Ok(json_to_dyn(&v)),
+            Err(e) => Err(to_err(format!("from_json: JSON inválido: {e}"))),
+        }
+    });
+    engine.register_fn("basename", |p: &str| -> String {
+        std::path::Path::new(p).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    });
+    engine.register_fn("dirname", |p: &str| -> String {
+        std::path::Path::new(p).parent().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    });
+    let sb = sandbox.clone();
+    let ct = counter.clone();
+    engine.register_fn("path_exists", move |path: &str| -> Result<bool, Box<EvalAltResult>> {
+        bump(&ct, "path_exists");
+        path_exists_impl(&sb, path)
     });
 
     // Rhai's own `replace` MUTATES the string in place and returns unit, so

@@ -6,15 +6,23 @@ use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone)]
 pub struct Sandbox {
+    /// Modo `--dry-run`: primitiva que mutaria disco ou rodaria comando
+    /// apenas anuncia o que faria (#16).
+    pub dry: bool,
     /// Canonicalized root. All resolved paths must live under this.
     pub root: PathBuf,
 }
 
 impl Sandbox {
+    pub fn with_dry(mut self, dry: bool) -> Self {
+        self.dry = dry;
+        self
+    }
+
     pub fn new(workdir: &Path) -> Result<Self, String> {
         let root = std::fs::canonicalize(workdir)
             .map_err(|e| format!("workdir {:?} does not exist or is inaccessible: {e}", workdir))?;
-        Ok(Sandbox { root })
+        Ok(Sandbox { root, dry: false })
     }
 
     /// Lexically collapse `.` and `..` without touching the filesystem.

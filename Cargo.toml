@@ -10,7 +10,9 @@ name = "codemode"
 path = "src/main.rs"
 
 [dependencies]
-rhai = { version = "1.19", features = ["sync"] }
+# "internals" expõe o AST: é o que permite o pré-voo resolver símbolo
+# olhando as chamadas de verdade em vez de regex sobre o fonte (#13).
+rhai = { version = "1.19", features = ["sync", "internals", "metadata"] }
 glob = "0.3"
 clap = { version = "4", features = ["derive"] }
 shell-words = "1"

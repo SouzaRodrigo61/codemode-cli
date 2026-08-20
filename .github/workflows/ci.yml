@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      # A propria biblioteca do repo passa pelo pre-voo: script quebrado em
+      # .codemode/ so aparecia quando alguem tentava rodar (#16).
+      - name: check da biblioteca .codemode/
+        run: |
+          cargo build
+          for s in .codemode/*.rhai; do ./target/debug/codemode check "$s" || exit 1; done

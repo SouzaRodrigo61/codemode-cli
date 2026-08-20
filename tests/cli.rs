@@ -78,6 +78,7 @@ fn edit_file_replaces_unique_match() {
     assert_eq!(content, "hello there");
 }
 
+#[allow(dead_code)] // usado só por testes que dependem do rtk no PATH
 fn rtk_available() -> bool {
     std::process::Command::new("rtk")
         .arg("--help")
@@ -786,7 +787,7 @@ fn append_file_adds_without_reading() {
 /// fires BEFORE the run -- the incident never errored, so anything wired to
 /// the failure path would have stayed silent.
 #[test]
-fn replaced_returns_a_new_string_and_mutating_replace_is_warned() {
+fn replaced_returns_a_new_string_and_mutating_replace_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "VELHO conteudo aqui\n").unwrap();
     let script = dir.path().join("s.rhai");
@@ -801,6 +802,9 @@ print("certo=" + replaced(atual, "VELHO", "NOVO"));
     )
     .unwrap();
 
+    // Desde #17 isto não é mais aviso: é erro de pré-voo. O script nem
+    // chega a rodar -- o incidente que apagou 70 arquivos nunca deu erro,
+    // então deixar executar com um aviso já se provou insuficiente.
     let out = cmd()
         .args(["run", script.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
         .output()
@@ -808,11 +812,25 @@ print("certo=" + replaced(atual, "VELHO", "NOVO"));
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "script deveria rodar: {stderr}");
-    assert!(stdout.contains("bugado_len=()"), "replace devia devolver unit: {stdout}");
-    assert!(stdout.contains("certo=NOVO conteudo aqui"), "replaced devia devolver string nova: {stdout}");
+    assert!(!out.status.success(), "atribuir replace tem que ser recusado: {stderr}");
+    assert!(stdout.is_empty(), "nada pode ter rodado: {stdout}");
     assert!(
         stderr.contains("MUTA em lugar") && stderr.contains("linha 3"),
-        "o aviso devia apontar a linha do replace atribuído: {stderr}"
+        "o erro devia apontar a linha do replace atribuído: {stderr}"
     );
+
+    // A forma correta continua funcionando.
+    std::fs::write(
+        &script,
+        r#"
+let atual = read_file("a.txt");
+print("certo=" + replaced(atual, "VELHO", "NOVO"));
+"#,
+    )
+    .unwrap();
+    cmd()
+        .args(["run", script.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("certo=NOVO conteudo aqui"));
 }

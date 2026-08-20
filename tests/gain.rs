@@ -73,12 +73,26 @@ fn conta_o_que_o_engine_despachou_nao_o_que_o_fonte_parece() {
 fn grava_tambem_a_execucao_que_falhou() {
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    run_in(home.path(), dir.path(), r#"run_shell("true"); nao_existe();"#).failure();
+    // Falha de runtime (o arquivo não existe), não de pré-voo: o que rodou
+    // antes continua contado.
+    run_in(home.path(), dir.path(), r#"run_shell("true"); read_file("nao-existe.txt");"#).failure();
 
     let l = linhas(home.path());
     assert_eq!(l.len(), 1);
     assert_eq!(l[0]["exit_code"], 1, "taxa de erro é um dos números do relatório");
     assert_eq!(l[0]["prims"]["run_shell"], 1, "o que rodou antes da falha continua contado");
+}
+
+#[test]
+fn falha_de_pre_voo_tambem_entra_no_log_com_zero_primitivas() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    run_in(home.path(), dir.path(), r#"run_shell("true"); nao_existe();"#).failure();
+
+    let l = linhas(home.path());
+    assert_eq!(l.len(), 1, "execução barrada no pré-voo ainda conta pra taxa de erro");
+    assert_eq!(l[0]["exit_code"], 1);
+    assert_eq!(l[0]["prim_total"], 0, "nada rodou: o pré-voo barrou antes");
 }
 
 #[test]
