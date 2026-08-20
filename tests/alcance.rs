@@ -628,3 +628,44 @@ print("acha=" + glob("docs/*.md").len());
         .stdout(predicates::str::contains("prefixo_ok=0"))
         .stdout(predicates::str::contains("acha=1"));
 }
+
+#[test]
+fn timeout_global_nomeia_o_comando_em_voo() {
+    // #79: a mensagem era só "script exceeded Ns timeout". Uma das 5 falhas de
+    // uso real medidas no #59 foi exit 124 num script com quatro
+    // `run_shell_full` (docker, ls, gh api): sem saber qual pendurou, a
+    // execucao inteira virou lixo e o script teve que ser reescrito só para
+    // bissectar. O watchdog mata o processo, entao a unica forma de dizer o
+    // que travou e registrar antes de bloquear.
+    let dir = tempfile::tempdir().unwrap();
+    let s = escreve(dir.path(), "print(\"antes\");\nrun_shell(\"sh -c \\\"sleep 5\\\"\");\n");
+
+    let out = cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap(), "--timeout", "2"])
+        .output()
+        .unwrap();
+    let erro = String::from_utf8_lossy(&out.stderr);
+    assert!(erro.contains("watchdog"), "{erro}");
+    assert!(erro.contains("run_shell"), "nomeia a primitiva: {erro}");
+    assert!(erro.contains("sleep 5"), "nomeia o comando: {erro}");
+}
+
+#[test]
+fn comando_muito_longo_e_truncado_na_mensagem_de_timeout() {
+    // A mensagem serve para identificar, nao para reproduzir: comando de 300
+    // caracteres despejado no stderr seria outro problema de contexto.
+    let dir = tempfile::tempdir().unwrap();
+    let enchimento = "a".repeat(200);
+    let s = escreve(
+        dir.path(),
+        &format!("run_shell(\"sh -c \\\"sleep 5 # {enchimento}\\\"\");\n"),
+    );
+
+    let out = cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap(), "--timeout", "2"])
+        .output()
+        .unwrap();
+    let erro = String::from_utf8_lossy(&out.stderr);
+    assert!(erro.contains("..."), "truncou: {erro}");
+    assert!(!erro.contains(&"a".repeat(100)), "nao despeja o comando inteiro: {erro}");
+}

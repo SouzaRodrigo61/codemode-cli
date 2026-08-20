@@ -1069,6 +1069,7 @@ fn tenta_pipeline(cmd: &str, sandbox: &Sandbox) -> Option<Result<String, Box<Eva
 }
 
 fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String, Box<EvalAltResult>> {
+    let _em_voo = marca_em_voo("run_shell", cmd);
     // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
     sandbox.cache.invalidar();
     if sandbox.dry {
@@ -1205,6 +1206,7 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
 /// `run_shell_full` (raw, typed). Same denylist gate, same uncatchable
 /// refusal.
 fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Map, Box<EvalAltResult>> {
+    let _em_voo = marca_em_voo("run_shell_full", cmd);
     // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
     sandbox.cache.invalidar();
     if sandbox.dry {
@@ -1322,6 +1324,7 @@ fn host_allowed(allow: &[String], host: &str, port: Option<u16>, https: bool) ->
 /// allowed) rather than embedding an HTTP+TLS stack into the binary: less
 /// native surface, not more, per the boundary lesson above.
 fn http_get_impl(allow: &[String], url: &str) -> Result<Map, Box<EvalAltResult>> {
+    let _em_voo = marca_em_voo("http_get", url);
     let (host, port, https) = parse_http_host(url).map_err(to_err)?;
     if !host_allowed(allow, &host, port, https) {
         return Err(Box::new(EvalAltResult::ErrorTerminated(
@@ -1694,6 +1697,45 @@ pub fn new_counter() -> Counter {
 /// Mutex e somar o BTreeMap ali custava 27% do tempo de um script
 /// computacional (#39).
 static TOTAL_CHAMADAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// O que está executando AGORA numa chamada nativa bloqueante.
+///
+/// O watchdog global mata o processo inteiro quando o deadline estoura, e até
+/// o #79 a mensagem era só "script exceeded 30s timeout": quem lia não sabia
+/// qual comando travou. Uma das 5 falhas de uso real medidas no #59 foi
+/// exatamente isso -- um script de diagnóstico com quatro `run_shell_full`
+/// (docker, ls, gh api) morreu em exit 124 sem dizer qual deles pendurou, e a
+/// execução inteira virou lixo.
+static EM_VOO: Mutex<Option<String>> = Mutex::new(None);
+
+/// Guarda RAII: limpa mesmo se a chamada nativa retornar por erro.
+pub struct MarcaEmVoo;
+
+impl Drop for MarcaEmVoo {
+    fn drop(&mut self) {
+        if let Ok(mut v) = EM_VOO.lock() {
+            *v = None;
+        }
+    }
+}
+
+pub fn marca_em_voo(primitiva: &str, arg: &str) -> MarcaEmVoo {
+    // Trunca: a mensagem serve para identificar, não para reproduzir.
+    let arg = if arg.chars().count() > 70 {
+        let corte: String = arg.chars().take(67).collect();
+        format!("{corte}...")
+    } else {
+        arg.to_string()
+    };
+    if let Ok(mut v) = EM_VOO.lock() {
+        *v = Some(format!("{primitiva}({arg:?})"));
+    }
+    MarcaEmVoo
+}
+
+pub fn em_voo() -> Option<String> {
+    EM_VOO.lock().ok().and_then(|v| v.clone())
+}
 
 pub fn total_chamadas() -> u64 {
     TOTAL_CHAMADAS.load(std::sync::atomic::Ordering::Relaxed)
