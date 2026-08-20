@@ -482,7 +482,7 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
                 eprintln!("codemode: dica: {hint}");
             }
             if json {
-                imprime_json(&counter, &sink, 1, started);
+                imprime_json(&counter, &sink, 1, started, max_context);
             } else {
                 print_sink(&sink, max_context);
             }
@@ -501,7 +501,7 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
 
     let _ = handle.join();
     if json {
-        imprime_json(&counter, &sink, 0, started);
+        imprime_json(&counter, &sink, 0, started, max_context);
     } else {
         print_sink(&sink, max_context);
     }
@@ -519,14 +519,33 @@ fn primitiva_unica_como_shell(source: &str) -> Option<String> {
 }
 
 /// `--json` (#2): a saída vira dado, não prosa pro modelo reparsear.
-fn imprime_json(counter: &primitives::Counter, sink: &primitives::SharedSink, exit_code: i32, started: Instant) {
+fn imprime_json(
+    counter: &primitives::Counter,
+    sink: &primitives::SharedSink,
+    exit_code: i32,
+    started: Instant,
+    max_context: usize,
+) {
     let prims: std::collections::BTreeMap<String, u64> = counter.lock().map(|m| m.clone()).unwrap_or_default();
     let prim_total: u64 = prims.values().sum();
-    let (saida, truncado) = sink.lock().map(|s| (s.buf.clone(), s.truncated)).unwrap_or_default();
+    let (saida, truncado, maior_push) =
+        sink.lock().map(|s| (s.buf.clone(), s.truncated, s.maior_push)).unwrap_or_default();
+    // O aviso de contexto (#62) tambem sai no stderr aqui: `--json` e o modo que
+    // um agente usa, e era exatamente onde ele nao existia -- a guarda ficava
+    // inerte justamente no caminho que ela existe para proteger.
+    if let Ok(s) = sink.lock() {
+        avisa_contexto(&s, max_context);
+    }
     let corpo = serde_json::json!({
         "exit_code": exit_code,
         "output": saida,
         "truncated": truncado,
+        // Byte de contexto e o que custa token; quem consome o JSON precisa do
+        // numero para decidir, nao so de uma linha em stderr que pode se perder.
+        "out_bytes": saida.len(),
+        "max_context": max_context,
+        "over_context": max_context > 0 && saida.len() > max_context,
+        "largest_print": maior_push,
         "prims": prims,
         "prim_total": prim_total,
         "calls_avoided": prim_total.saturating_sub(1),

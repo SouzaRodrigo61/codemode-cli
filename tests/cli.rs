@@ -1137,3 +1137,42 @@ fn aviso_de_contexto_nao_trunca_a_saida() {
     assert!(out.stdout.len() >= 90_000, "saida inteira preservada: {} B", out.stdout.len());
     assert!(!String::from_utf8_lossy(&out.stderr).contains("output truncated"));
 }
+
+#[test]
+fn modo_json_tambem_avisa_de_contexto_e_traz_o_numero() {
+    // O #62 nasceu inerte no modo que mais importa: `--json` e o caminho que um
+    // agente usa, e era exatamente onde o aviso nao existia. Alem do stderr, o
+    // JSON passa a trazer o numero, porque quem consome programaticamente
+    // precisa decidir com ele, nao com uma linha de log que pode se perder.
+    let dir = tempfile::tempdir().unwrap();
+    let s = script_que_despeja(dir.path(), 90_000);
+
+    let out = cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let erro = String::from_utf8_lossy(&out.stderr);
+    assert!(erro.contains("limiar de contexto"), "aviso no stderr: {erro}");
+
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(j["over_context"], true, "{j}");
+    assert_eq!(j["max_context"], 65_536);
+    assert!(j["out_bytes"].as_u64().unwrap() >= 90_000, "{j}");
+    assert_eq!(j["largest_print"], 90_000, "nomeia o tamanho do maior print: {j}");
+}
+
+#[test]
+fn modo_json_dentro_do_limiar_nao_marca_over_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = script_que_despeja(dir.path(), 1_000);
+
+    let out = cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(j["over_context"], false, "{j}");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("limiar de contexto"));
+}
