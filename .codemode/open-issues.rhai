@@ -39,6 +39,10 @@ if ARGS.len() < 1 {
             print("FALHA " + title + " :: " + r.stderr);
         }
     }
+    // O corpo e arquivo de trabalho, nao artefato do repo: sem isto ele
+    // sobrava no working tree e um `git add -A` de outro script acabava
+    // commitando (aconteceu no PR #56).
+    run_shell("rm -f " + tmp);
     print("---");
     print("criadas: " + criadas + "  falhas: " + falhas);
 }
