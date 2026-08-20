@@ -584,3 +584,47 @@ print("com=" + com + " de " + arqs.len());
         .success()
         .stdout(predicates::str::contains("com=1 de 2"));
 }
+
+#[test]
+fn glob_com_prefixo_literal_inexistente_erra_em_vez_de_devolver_vazio() {
+    // #72: o chamador NOMEOU o diretorio. Se nao existe, o provavel e typo, e
+    // devolver [] deixa o script seguir sem fazer nada -- resultado errado sem
+    // sinal. `read_file` de arquivo inexistente erra; glob era o outlier.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("docs")).unwrap();
+    fs::write(dir.path().join("docs/a.md"), "a").unwrap();
+
+    let s = escreve(dir.path(), r#"print(glob("dosc/*.md").len());"#);
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("does not exist"))
+        .stderr(predicates::str::contains("path_exists"));
+}
+
+#[test]
+fn glob_sem_prefixo_literal_continua_devolvendo_vazio_quando_nada_casa() {
+    // "Nada casou" e resposta legitima quando o padrao nao nomeia diretorio
+    // nenhum: `glob("**/*.zzz")` comeca no root, que sempre existe.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("docs")).unwrap();
+    fs::write(dir.path().join("docs/a.md"), "a").unwrap();
+
+    let s = escreve(
+        dir.path(),
+        r#"
+print("curinga=" + glob("**/*.zzz").len());
+print("prefixo_ok=" + glob("docs/*.zzz").len());
+print("acha=" + glob("docs/*.md").len());
+"#,
+    );
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("curinga=0"))
+        // Prefixo que EXISTE e nao casa nada segue devolvendo [].
+        .stdout(predicates::str::contains("prefixo_ok=0"))
+        .stdout(predicates::str::contains("acha=1"));
+}
