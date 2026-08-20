@@ -147,6 +147,39 @@ fn to_err(msg: impl Into<String>) -> Box<EvalAltResult> {
     msg.into().into()
 }
 
+/// `run_shell` com exit != 0 vira ERRO, num ponto de decisão só.
+///
+/// Até o #78, cada caminho interno decidia sozinho e o resultado era um
+/// contrato "depende": `sh -c "exit 7"` engolia, `cargo build` sem Cargo.toml
+/// engolia, `git status` fora de repo lançava. Acidente de qual arm tratou o
+/// erro, não política -- e quem escreve script não tinha como raciocinar.
+///
+/// A evidência de que engolir era o padrão errado: na varredura das 9
+/// bibliotecas `.codemode/` reais desta máquina, TRÊS gates passavam em
+/// silêncio, incluindo o `verify.rhai` do CONTRIBUTING de um repo de produto,
+/// cujo ramo de frontend era `print(run_shell("npm run lint && npm run
+/// build"))` -- build quebrado, gate verde.
+///
+/// Quem precisa de tolerância usa `run_shell_full`, que devolve
+/// `#{success, exit_code, stdout, stderr}` e continua sem lançar.
+///
+/// A saída entra na mensagem porque sem ela o erro não diz o que houve; vai
+/// truncada porque mensagem de erro também é contexto (#62).
+fn falha_de_shell(cmd: &str, codigo: i32, saida: &str) -> Box<EvalAltResult> {
+    const LIMITE: usize = 2000;
+    let saida = saida.trim_end();
+    let corpo = if saida.chars().count() > LIMITE {
+        let corte: String = saida.chars().take(LIMITE).collect();
+        format!("{corte}\n[... saída truncada]")
+    } else {
+        saida.to_string()
+    };
+    let sep = if corpo.is_empty() { "" } else { ":\n" };
+    to_err(format!(
+        "run_shell: `{cmd}` falhou (exit {codigo}){sep}{corpo}\n         -- use run_shell_full() se a falha for esperada e o script precisar decidir"
+    ))
+}
+
 // ---- read_file ----
 
 fn read_file_impl(sandbox: &Sandbox, path: &str) -> Result<String, Box<EvalAltResult>> {
@@ -558,9 +591,13 @@ fn try_in_process_filter(words: &[String], sandbox: &Sandbox) -> Option<Result<S
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
-            let mut filtered = rtk::filters::cargo_test(&combined);
+            let filtered = rtk::filters::cargo_test(&combined);
             if !output.status.success() {
-                filtered.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
+                return Some(Err(falha_de_shell(
+                    &words.join(" "),
+                    output.status.code().unwrap_or(-1),
+                    &filtered,
+                )));
             }
             Some(Ok(filtered))
         }
@@ -595,9 +632,13 @@ fn try_in_process_filter(words: &[String], sandbox: &Sandbox) -> Option<Result<S
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
-            let mut filtered = rtk::filters::npx(&combined);
+            let filtered = rtk::filters::npx(&combined);
             if !output.status.success() {
-                filtered.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
+                return Some(Err(falha_de_shell(
+                    &words.join(" "),
+                    output.status.code().unwrap_or(-1),
+                    &filtered,
+                )));
             }
             Some(Ok(filtered))
         }
@@ -618,9 +659,13 @@ fn try_in_process_filter(words: &[String], sandbox: &Sandbox) -> Option<Result<S
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
-            let mut filtered = rtk::filters::pnpm_run(&combined);
+            let filtered = rtk::filters::pnpm_run(&combined);
             if !output.status.success() {
-                filtered.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
+                return Some(Err(falha_de_shell(
+                    &words.join(" "),
+                    output.status.code().unwrap_or(-1),
+                    &filtered,
+                )));
             }
             Some(Ok(filtered))
         }
@@ -639,9 +684,13 @@ fn try_in_process_filter(words: &[String], sandbox: &Sandbox) -> Option<Result<S
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
-            let mut filtered = rtk::filters::make_output(&combined);
+            let filtered = rtk::filters::make_output(&combined);
             if !output.status.success() {
-                filtered.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
+                return Some(Err(falha_de_shell(
+                    &words.join(" "),
+                    output.status.code().unwrap_or(-1),
+                    &filtered,
+                )));
             }
             Some(Ok(filtered))
         }
@@ -719,9 +768,9 @@ fn try_comando_nativo(words: &[String], sandbox: &Sandbox) -> Option<Result<Stri
     fn ok(s: String) -> Option<Result<String, Box<EvalAltResult>>> {
         Some(Ok(s))
     }
-    fn falha(codigo: i32) -> Option<Result<String, Box<EvalAltResult>>> {
-        Some(Ok(format!("\n[exit code: {codigo}]")))
-    }
+    let falha = |codigo: i32| -> Option<Result<String, Box<EvalAltResult>>> {
+        Some(Err(falha_de_shell(&words.join(" "), codigo, "")))
+    };
     let ler = |p: &str| -> Option<String> {
         let alvo = sandbox.resolve(p).ok()?;
         fs::read_to_string(alvo).ok()
@@ -1190,7 +1239,7 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
     combined.push_str(&String::from_utf8_lossy(&output.stdout));
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     if !output.status.success() {
-        combined.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
+        return Err(falha_de_shell(cmd, output.status.code().unwrap_or(-1), &combined));
     }
     Ok(combined)
 }

@@ -82,12 +82,17 @@ fn test_de_arquivo_devolve_o_mesmo_codigo() {
     let dir = cenario();
     // `run_shell` anexa "[exit code: N]" quando o comando falha: é assim que
     // o script enxerga fracasso.
+    // Depois do #78, `run_shell` LANÇA em exit != 0, e `test` usa o exit code
+    // como booleano -- entao quem quer o codigo usa `run_shell_full`, que e o
+    // que o contrato novo manda. O pre-voo ja apontava `path_exists()` para
+    // este caso antes mesmo da mudanca.
     let script = dir.path().join("s.rhai");
     fs::write(
         &script,
         r#"
 print("existe=[" + run_shell("test -f a.txt") + "]");
-print("nao=[" + run_shell("test -f nao-existe.txt") + "]");
+let nao = run_shell_full("test -f nao-existe.txt");
+print("nao_exit=" + nao.exit_code + " sucesso=" + nao.success);
 print("dir=[" + run_shell("test -d sub") + "]");
 "#,
     )
@@ -97,7 +102,9 @@ print("dir=[" + run_shell("test -d sub") + "]");
         .assert()
         .success()
         .stdout(predicates::str::contains("existe=[]"))
-        .stdout(predicates::str::contains("exit code: 1"))
+        // O invariante que este teste protege segue o mesmo: o `test` em
+        // processo devolve o MESMO codigo do binario real.
+        .stdout(predicates::str::contains("nao_exit=1 sucesso=false"))
         .stdout(predicates::str::contains("dir=[]"));
 }
 
