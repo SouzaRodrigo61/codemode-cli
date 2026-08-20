@@ -228,3 +228,54 @@ try {
         .failure()
         .stderr(predicates::str::contains("denylist"));
 }
+
+#[test]
+fn grep_nativo_respeita_gitignore() {
+    // O walker antigo descia em tudo: num repo com target/ de GBs a
+    // primitiva levava segundos e perdia pro shell (#28).
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(".gitignore"), "ignorado/\n").unwrap();
+    fs::create_dir_all(dir.path().join("ignorado")).unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/a.rs"), "fn alvo_da_busca() {}\n").unwrap();
+    fs::write(dir.path().join("ignorado/b.rs"), "fn alvo_da_busca() {}\n").unwrap();
+    // Binário: não pode nem ser lido inteiro, nem casar.
+    fs::write(dir.path().join("src/bin.dat"), [0u8, 1, 2, 3, b'a', b'l', b'v', b'o']).unwrap();
+    std::process::Command::new("git").arg("init").arg("-q").current_dir(dir.path()).status().unwrap();
+
+    let s = escreve(dir.path(), r#"print(grep("alvo_da_busca", "."));"#);
+    let out = cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let saida = String::from_utf8_lossy(&out.stdout);
+    assert!(saida.contains("src/a.rs"), "devia achar no arquivo versionado: {saida}");
+    assert!(!saida.contains("ignorado/"), "não pode entrar no que o .gitignore exclui: {saida}");
+    assert!(!saida.contains("bin.dat"), "binário não entra na busca: {saida}");
+}
+
+#[test]
+fn grep_nativo_devolve_resultado_ordenado() {
+    // Walker paralelo devolve fora de ordem; resultado de busca precisa ser
+    // reproduzível entre execuções.
+    let dir = tempfile::tempdir().unwrap();
+    for nome in ["c.txt", "a.txt", "b.txt"] {
+        fs::write(dir.path().join(nome), "marcador\n").unwrap();
+    }
+    let s = escreve(dir.path(), r#"print(grep("marcador", "."));"#);
+    let primeira = cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let segunda = cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(primeira.stdout, segunda.stdout, "duas buscas iguais têm que dar a mesma saída");
+    let saida = String::from_utf8_lossy(&primeira.stdout);
+    let ordem: Vec<&str> =
+        saida.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| l.split(':').next()).collect();
+    let mut ordenado = ordem.clone();
+    ordenado.sort();
+    assert_eq!(ordem, ordenado, "saída deve vir ordenada por caminho: {saida}");
+}

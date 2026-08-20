@@ -135,10 +135,15 @@ fn to_err(msg: impl Into<String>) -> Box<EvalAltResult> {
 
 fn read_file_impl(sandbox: &Sandbox, path: &str) -> Result<String, Box<EvalAltResult>> {
     let resolved = sandbox.resolve(path).map_err(to_err)?;
-    if !resolved.exists() {
-        return Err(to_err(format!("read_file: {:?} does not exist", path)));
-    }
-    let mut f = fs::File::open(&resolved).map_err(|e| to_err(format!("read_file: {:?}: {e}", path)))?;
+    // Sem `exists()` antes do open: era um `stat` a mais por leitura, e o
+    // proprio open ja distingue "nao existe" de "sem permissao" (#43).
+    let mut f = fs::File::open(&resolved).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            to_err(format!("read_file: {:?} does not exist", path))
+        } else {
+            to_err(format!("read_file: {:?}: {e}", path))
+        }
+    })?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).map_err(|e| to_err(format!("read_file: {:?}: {e}", path)))?;
     String::from_utf8(buf).map_err(|_| to_err(format!("read_file: {:?} is not valid UTF-8", path)))
@@ -188,7 +193,17 @@ fn write_file_guarded(sandbox: &Sandbox, path: &str, content: &str) -> Result<()
             )));
         }
     }
-    write_file_impl(sandbox, path, content)
+    if sandbox.dry {
+        eprintln!("codemode: [dry-run] write_file({path:?}, {} bytes)", content.len());
+        return Ok(());
+    }
+    // Resolve UMA vez: antes, `write_file_guarded` resolvia e chamava
+    // `write_file_impl`, que resolvia tudo de novo -- duas travessias de
+    // sandbox por escrita (#43).
+    if let Some(pai) = resolved.parent() {
+        fs::create_dir_all(pai).map_err(|e| to_err(format!("write_file: {:?}: {e}", path)))?;
+    }
+    fs::write(&resolved, content).map_err(|e| to_err(format!("write_file: {:?}: {e}", path)))
 }
 
 // ---- append_file ----
@@ -326,7 +341,7 @@ fn try_in_process_filter(words: &[String], sandbox: &Sandbox) -> Option<Result<S
 
     match words {
         [cargo, sub] if cargo == "cargo" && sub == "test" => {
-            let output = Command::new("cargo").arg("test").current_dir(&sandbox.root).output();
+            let output = { let mut c = Command::new("cargo"); c.arg("test").current_dir(&sandbox.root); exec_com_deadline(c, sandbox.cmd_timeout, "cargo test") };
             let output = match output {
                 Ok(o) => o,
                 Err(e) => return Some(Err(to_err(format!("run_shell: failed to spawn cargo: {e}")))),
@@ -363,7 +378,7 @@ fn try_in_process_filter(words: &[String], sandbox: &Sandbox) -> Option<Result<S
         // shapes have no filter yet), npx's filter is real and simple: a
         // pure output-boilerplate strip, same one `npm run` uses.
         [npx, rest @ ..] if npx == "npx" && !rest.is_empty() => {
-            let output = Command::new("npx").args(rest).current_dir(&sandbox.root).output();
+            let output = { let mut c = Command::new("npx"); c.args(rest).current_dir(&sandbox.root); exec_com_deadline(c, sandbox.cmd_timeout, "npx") };
             let output = match output {
                 Ok(o) => o,
                 Err(e) => return Some(Err(to_err(format!("run_shell: failed to spawn npx: {e}")))),
@@ -386,7 +401,7 @@ fn try_in_process_filter(words: &[String], sandbox: &Sandbox) -> Option<Result<S
         // conservative npm-boilerplate-strip fallback for non-test output.
         // All args pass through to the real pnpm/npm invocation untouched.
         [pm, sub, rest @ ..] if (pm == "pnpm" || pm == "npm") && (sub == "test" || sub == "run") => {
-            let output = Command::new(pm.as_str()).arg(sub.as_str()).args(rest).current_dir(&sandbox.root).output();
+            let output = { let mut c = Command::new(pm.as_str()); c.arg(sub.as_str()).args(rest).current_dir(&sandbox.root); exec_com_deadline(c, sandbox.cmd_timeout, pm.as_str()) };
             let output = match output {
                 Ok(o) => o,
                 Err(e) => return Some(Err(to_err(format!("run_shell: failed to spawn {pm}: {e}")))),
@@ -407,7 +422,7 @@ fn try_in_process_filter(words: &[String], sandbox: &Sandbox) -> Option<Result<S
         // design: collapses embedded cargo compile-progress runs, drops
         // Entering/Leaving chatter, passes everything else through.
         [make, rest @ ..] if make == "make" => {
-            let output = Command::new("make").args(rest).current_dir(&sandbox.root).output();
+            let output = { let mut c = Command::new("make"); c.args(rest).current_dir(&sandbox.root); exec_com_deadline(c, sandbox.cmd_timeout, "make") };
             let output = match output {
                 Ok(o) => o,
                 Err(e) => return Some(Err(to_err(format!("run_shell: failed to spawn make: {e}")))),
@@ -758,34 +773,97 @@ fn confirm_from_map(opts: &Map) -> bool {
 
 // ---- grep ----
 
+/// Busca nativa. Antes desta versao o walker descia a arvore inteira pulando
+/// so `.git`, lia cada arquivo como UTF-8 (binario incluido, que so falhava
+/// DEPOIS de ser lido inteiro) e rodava numa thread so: no proprio repo isso
+/// custava 2.590ms -- quatro vezes mais lento que sair pro shell, que era
+/// exatamente o que a primitiva existia pra evitar (#28).
+///
+/// Agora usa o walker do ripgrep (crate `ignore`, ja no grafo via rtk):
+/// respeita `.gitignore`, pula `.git/`, farejando binario pelos primeiros
+/// bytes ANTES de ler o arquivo inteiro, em paralelo. A saida sai ordenada
+/// por caminho de proposito -- walker paralelo devolve fora de ordem, e
+/// resultado de busca precisa ser reproduzivel.
 fn grep_fallback(sandbox: &Sandbox, pattern: &str, start: &std::path::Path) -> String {
-    let mut out = String::new();
-    let mut stack = vec![start.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                if p.file_name().map(|n| n == ".git").unwrap_or(false) {
-                    continue;
-                }
-                stack.push(p);
-            } else if let Ok(content) = fs::read_to_string(&p) {
-                for (i, line) in content.lines().enumerate() {
-                    if line.contains(pattern) {
-                        let rel = p.strip_prefix(&sandbox.root).unwrap_or(&p);
-                        out.push_str(&format!("{}:{}:{}\n", rel.display(), i + 1, line));
-                    }
+    use std::io::Read;
+    use std::sync::Mutex;
+
+    let achados: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    let raiz = sandbox.root.clone();
+    let alvo = pattern.to_string();
+
+    let mut construtor = ignore::WalkBuilder::new(start);
+    construtor
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .hidden(false)
+        .threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
+
+    construtor.build_parallel().run(|| {
+        let achados = &achados;
+        let raiz = raiz.clone();
+        let alvo = alvo.clone();
+        Box::new(move |resultado| {
+            let Ok(entrada) = resultado else {
+                return ignore::WalkState::Continue;
+            };
+            if entrada.file_name() == ".git" {
+                return ignore::WalkState::Skip;
+            }
+            if !entrada.file_type().is_some_and(|t| t.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+            let caminho = entrada.path();
+            let Ok(mut f) = fs::File::open(caminho) else {
+                return ignore::WalkState::Continue;
+            };
+            // Fareja binario nos primeiros 8 KB antes de ler o resto: sem
+            // isto, um .rlib de 300 MB era lido inteiro so pra ser descartado.
+            let mut inicio = [0u8; 8192];
+            let Ok(lidos) = f.read(&mut inicio) else {
+                return ignore::WalkState::Continue;
+            };
+            if inicio[..lidos].contains(&0) {
+                return ignore::WalkState::Continue;
+            }
+            let mut resto = Vec::new();
+            if f.read_to_end(&mut resto).is_err() {
+                return ignore::WalkState::Continue;
+            }
+            let mut bytes = inicio[..lidos].to_vec();
+            bytes.extend_from_slice(&resto);
+            let Ok(conteudo) = String::from_utf8(bytes) else {
+                return ignore::WalkState::Continue;
+            };
+            let rel = caminho.strip_prefix(&raiz).unwrap_or(caminho).display().to_string();
+            let mut locais = String::new();
+            for (i, linha) in conteudo.lines().enumerate() {
+                if linha.contains(&alvo) {
+                    locais.push_str(&format!("{}:{}:{}\n", rel, i + 1, linha));
                 }
             }
-        }
-    }
-    out
+            if !locais.is_empty() {
+                if let Ok(mut acc) = achados.lock() {
+                    acc.push((rel, locais));
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
+
+    let mut acc = achados.into_inner().unwrap_or_default();
+    acc.sort_by(|a, b| a.0.cmp(&b.0));
+    acc.into_iter().map(|(_, texto)| texto).collect()
 }
 
 fn grep_impl(sandbox: &Sandbox, pattern: &str, path: &str) -> Result<String, Box<EvalAltResult>> {
     let resolved = sandbox.resolve(path).map_err(to_err)?;
-    match Command::new("rg").arg("-n").arg("--no-heading").arg(pattern).arg(&resolved).output() {
+    let dbg = std::env::var("CODEMODE_DEBUG_GREP").is_ok();
+    let t = std::time::Instant::now();
+    let r = { let mut c = Command::new("rg"); c.arg("-n").arg("--no-heading").arg(pattern).arg(&resolved); exec_com_deadline(c, sandbox.cmd_timeout, "rg") };
+    if dbg { eprintln!("DBG tentativa de rg: {:?} em {:.1}ms", r.as_ref().map(|_| "ok").map_err(|e| e.kind()), t.elapsed().as_secs_f64()*1000.0); }
+    match r {
         Ok(output) => {
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -926,6 +1004,17 @@ fn path_exists_impl(sandbox: &Sandbox, path: &str) -> Result<bool, Box<EvalAltRe
 /// exponencial (200µs até 20ms) para não somar latência a comando rápido --
 /// as duas pontas dos pipes são drenadas em threads, senão um comando
 /// falante encheria o buffer e travaria antes do deadline.
+/// Comandos rodando em paralelo neste processo (#45).
+static EM_PARALELO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct GuardaParalelo;
+
+impl Drop for GuardaParalelo {
+    fn drop(&mut self) {
+        EM_PARALELO.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn exec_com_deadline(
     mut c: Command,
     timeout: u64,
@@ -952,7 +1041,13 @@ fn exec_com_deadline(
     // custar) e sem gastar duas threads de leitura. Medido em três
     // `run_shell("true")`: 8,0ms antes do deadline existir, 12,3ms com poll
     // dormindo e threads sempre, 8,6ms assim.
-    let janela_rapida = Duration::from_millis(8);
+    // Com N comandos concorrentes seriam N threads girando e disputando CPU
+    // com os proprios comandos: sob paralelismo a janela encolhe (#45).
+    let janela_rapida = if EM_PARALELO.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        Duration::from_micros(500)
+    } else {
+        Duration::from_millis(8)
+    };
     while inicio.elapsed() < janela_rapida {
         if let Some(status) = child.try_wait()? {
             let mut so = Vec::new();
@@ -1054,6 +1149,8 @@ fn parallel_shell_impl(sandbox: &Sandbox, cmds: Array) -> Result<Array, Box<Eval
 
     let limite = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(1);
     let mut saida = Array::new();
+    EM_PARALELO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _guarda = GuardaParalelo;
     for bloco in lista.chunks(limite) {
         let mut parciais: Vec<Result<Map, String>> = Vec::with_capacity(bloco.len());
         std::thread::scope(|escopo| {

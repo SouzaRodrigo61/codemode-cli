@@ -259,6 +259,19 @@ at the machine's parallelism, and returns the `run_shell_full` maps **in
 order**. The denylist is checked before anything is dispatched, so a refusal
 can never hide inside a thread.
 
+## Native search that respects your ignore rules
+
+`grep(pattern, path)` uses the ripgrep walker (`ignore`), so it honors
+`.gitignore`, skips `.git/`, sniffs binaries by their first 8 KB instead of
+reading them whole, and walks in parallel. Results come back sorted by path,
+because a parallel walk returns them out of order and a search result has to
+be reproducible.
+
+Measured on this repo (2.9 GB of `target/`): **3,062 ms → 13 ms**. The old
+walker descended into everything and read every file as UTF-8 before finding
+out it was a binary — it was four times slower than shelling out to `grep`,
+which is exactly what the primitive existed to avoid.
+
 ## Known traps
 
 Paid for already — don't rediscover them:
