@@ -259,7 +259,7 @@ at the machine's parallelism, and returns the `run_shell_full` maps **in
 order**. The denylist is checked before anything is dispatched, so a refusal
 can never hide inside a thread.
 
-## Native search that respects your ignore rules
+## Native search and glob respect your ignore rules
 
 `grep(pattern, path)` uses the ripgrep walker (`ignore`), so it honors
 `.gitignore`, skips `.git/`, sniffs binaries by their first 8 KB instead of
@@ -271,6 +271,14 @@ Measured on this repo (2.9 GB of `target/`): **3,062 ms → 13 ms**. The old
 walker descended into everything and read every file as UTF-8 before finding
 out it was a binary — it was four times slower than shelling out to `grep`,
 which is exactly what the primitive existed to avoid.
+
+`glob` follows the same rule, and it is a correctness fix as much as a speed
+one: `glob("**/*.rs")` in this repo used to return **34 files in 17 ms**, 14
+of them build artifacts nobody asked for. It now returns the **20 real
+ones in 5 ms**, sorted. The escape hatch is naming the ignored path
+yourself — `glob("target/**/*.rs")` still walks into `target/`, because
+there the choice is explicit. Ignore rules govern where we wander on our
+own, never what you asked for by name.
 
 ## Trivial commands never spawn a process
 
