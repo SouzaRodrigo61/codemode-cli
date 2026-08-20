@@ -666,6 +666,13 @@ fn comando_muito_longo_e_truncado_na_mensagem_de_timeout() {
         .output()
         .unwrap();
     let erro = String::from_utf8_lossy(&out.stderr);
-    assert!(erro.contains("..."), "truncou: {erro}");
-    assert!(!erro.contains(&"a".repeat(100)), "nao despeja o comando inteiro: {erro}");
+    // A asserção olha a LINHA do watchdog, não o stderr inteiro: o aviso de
+    // primitiva única também fala do mesmo comando, e misturar os dois fez o
+    // teste acusar a linha errada quando o #86 mudou o aviso.
+    let linha = erro
+        .lines()
+        .find(|l| l.contains("watchdog"))
+        .unwrap_or_else(|| panic!("sem linha de watchdog em: {erro}"));
+    assert!(linha.contains("..."), "truncou: {linha}");
+    assert!(!linha.contains(&"a".repeat(100)), "nao despeja o comando inteiro: {linha}");
 }
