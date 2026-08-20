@@ -379,6 +379,28 @@ run against `examples/fixtures/{a,b,c}.conf`.
 
 **6 → 1, an 83% reduction in tool-calls for this task.**
 
+## Measuring what it actually saved: `codemode gain`
+
+Every run appends one JSON line to `~/.codemode/runs.jsonl` (override with
+`CODEMODE_HOME`, disable with `CODEMODE_NO_TELEMETRY=1`). Metadata only —
+a hash of the source, the per-primitive call counts the engine actually
+dispatched, output bytes, exit code, duration, workdir. Never the source
+itself, never file contents, never command output, never `--arg` values.
+Writing the log is best-effort: if it fails, the run still succeeds.
+
+```
+codemode gain              # summary: calls avoided, error rate, waste buckets
+codemode gain --history    # the last runs, one per line
+codemode gain --json       # the aggregate, for scripting
+```
+
+The buckets are the point. A script with 3+ primitives is a real collapse;
+one with a single primitive cost *more* than the equivalent `Bash` call —
+that bucket is measured waste, not a rounding error. The first audit of
+this tool (200 real runs) found 17% of runs in it, and 18% of runs failing
+outright. Without this log, none of that was knowable; it had to be
+reverse-engineered out of the host CLI's transcripts.
+
 ## Tests
 
 `cargo test` covers (see `src/sandbox.rs`, `src/denylist.rs`,
