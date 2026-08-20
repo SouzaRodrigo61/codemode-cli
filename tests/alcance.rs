@@ -375,3 +375,87 @@ print("lidos=" + total);
         .stdout(predicates::str::contains("ordem=a.txt,b.txt,c.txt"))
         .stdout(predicates::str::contains("lidos=6"));
 }
+
+#[test]
+fn glob_com_padrao_absoluto_encontra_em_vez_de_devolver_vazio() {
+    // #60: o padrao era casado contra o caminho RELATIVO ao root, entao
+    // padrao absoluto percorria o diretorio certo e nunca casava nada --
+    // devolvia [] sem erro, sem aviso. Resultado errado sem sinal e a mesma
+    // familia do `replace` devolvendo unit: custa token duas vezes, porque o
+    // script roda em falso e depois alguem refaz na mao.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("docs")).unwrap();
+    fs::write(dir.path().join("docs/a.md"), "a").unwrap();
+    fs::write(dir.path().join("docs/b.md"), "b").unwrap();
+
+    let raiz = fs::canonicalize(dir.path()).unwrap();
+    let s = escreve(
+        dir.path(),
+        &format!(
+            r#"
+let abs = glob("{raiz}/docs/*.md");
+print("abs=" + abs.len());
+print("primeiro=" + abs[0]);
+print("rel=" + glob("docs/*.md").len());
+"#,
+            raiz = raiz.display()
+        ),
+    );
+
+    let esperado = format!("primeiro={}/docs/a.md", raiz.display());
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("abs=2"))
+        // Padrao absoluto devolve caminho absoluto: e o que o chamador pediu,
+        // e o que ele vai passar adiante pro read_file.
+        .stdout(predicates::str::contains(esperado))
+        // E o padrao relativo continua se comportando igual.
+        .stdout(predicates::str::contains("rel=2"));
+}
+
+#[test]
+fn glob_absoluto_alcanca_extra_root() {
+    // O caso que motivou a issue: auditar dois escopos (o do projeto e o do
+    // usuario) numa execucao so. Sem alcancar `--extra-root`, o script tinha
+    // que ser reescrito para rodar com o HOME de workdir.
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    fs::write(b.path().join("x.md"), "x").unwrap();
+    fs::write(b.path().join("y.md"), "y").unwrap();
+    let outro = fs::canonicalize(b.path()).unwrap();
+
+    let s = escreve(a.path(), &format!(r#"print("n=" + glob("{}/*.md").len());"#, outro.display()));
+
+    cmd()
+        .args([
+            "run",
+            s.to_str().unwrap(),
+            "--workdir",
+            a.path().to_str().unwrap(),
+            "--extra-root",
+            b.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("n=2"));
+}
+
+#[test]
+fn glob_absoluto_fora_de_qualquer_root_e_erro_explicito() {
+    // Nao devolve vazio: recusa com a mesma mensagem que o resto do sandbox
+    // ja da. Ausencia de resultado e ambigua; recusa nao e.
+    let dir = tempfile::tempdir().unwrap();
+    let fora = tempfile::tempdir().unwrap();
+    fs::write(fora.path().join("segredo.md"), "nao").unwrap();
+    let proibido = fs::canonicalize(fora.path()).unwrap();
+
+    let s = escreve(dir.path(), &format!(r#"print(glob("{}/*.md").len());"#, proibido.display()));
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("outside sandbox workdir"));
+}
