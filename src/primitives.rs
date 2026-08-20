@@ -1479,8 +1479,58 @@ fn grep_fallback(sandbox: &Sandbox, pattern: &str, start: &std::path::Path) -> S
     acc.into_iter().map(|(_, texto)| texto).collect()
 }
 
+/// Alinha os caminhos da saida com a FORMA do argumento: absoluto entrou,
+/// absoluto sai; relativo entrou, relativo ao workdir sai.
+///
+/// Sem isto, o `rg` decidia sozinho -- imprimia relativo ao cwd para diretorio
+/// sob o workdir e absoluto para diretorio em `--extra-root`, independente do
+/// que o chamador escreveu. Mesma chamada, dois formatos, e quem consome nao
+/// tem como saber qual esperar (#71).
+///
+/// Custou caro uma vez: uma auditoria comparando o resultado do `glob` (que
+/// desde o #60 devolve absoluto para padrao absoluto) com o do `grep` reportou
+/// "18 agentes sem o bloco de disciplina" quando os 18 tinham. Nenhum erro, so
+/// resultado errado -- a mesma classe de falha do #60.
+///
+/// Linha que nao tem a forma `caminho:linha:` (stderr do rg, por exemplo) passa
+/// intacta: reescrever o que nao se entende seria trocar um erro por outro.
+fn alinha_caminhos(saida: &str, raiz: &std::path::Path, absoluto: bool) -> String {
+    let raiz_txt = raiz.display().to_string();
+    let prefixo = format!("{}/", raiz_txt.trim_end_matches('/'));
+    let mut out = String::with_capacity(saida.len());
+    for linha in saida.split_inclusive('\n') {
+        let (corpo, quebra) = match linha.strip_suffix('\n') {
+            Some(c) => (c, "\n"),
+            None => (linha, ""),
+        };
+        let convertida = match corpo.split_once(':') {
+            Some((caminho, resto)) if !caminho.is_empty() => {
+                if absoluto && !caminho.starts_with('/') {
+                    Some(format!("{prefixo}{caminho}:{resto}"))
+                } else if !absoluto {
+                    caminho
+                        .strip_prefix(&prefixo)
+                        .map(|rel| format!("{rel}:{resto}"))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        match convertida {
+            Some(c) => {
+                out.push_str(&c);
+                out.push_str(quebra);
+            }
+            None => out.push_str(linha),
+        }
+    }
+    out
+}
+
 fn grep_impl(sandbox: &Sandbox, pattern: &str, path: &str) -> Result<String, Box<EvalAltResult>> {
     let resolved = sandbox.resolve(path).map_err(to_err)?;
+    let absoluto = std::path::Path::new(path).is_absolute();
     let dbg = std::env::var("CODEMODE_DEBUG_GREP").is_ok();
     let t = std::time::Instant::now();
     let r = { let mut c = Command::new("rg"); c.arg("-n").arg("--no-heading").arg(pattern).arg(&resolved); exec_com_deadline(c, sandbox.cmd_timeout, "rg") };
@@ -1490,9 +1540,12 @@ fn grep_impl(sandbox: &Sandbox, pattern: &str, path: &str) -> Result<String, Box
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
-            Ok(combined)
+            Ok(alinha_caminhos(&combined, &sandbox.root, absoluto))
         }
-        Err(_) => Ok(grep_fallback(sandbox, pattern, &resolved)),
+        Err(_) => {
+            let bruto = grep_fallback(sandbox, pattern, &resolved);
+            Ok(alinha_caminhos(&bruto, &sandbox.root, absoluto))
+        }
     }
 }
 
