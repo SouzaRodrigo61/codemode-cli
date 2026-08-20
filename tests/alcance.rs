@@ -496,3 +496,91 @@ print("relativo=" + glob("um.md").len());
         // Relativo sem curinga ja funcionava e continua igual.
         .stdout(predicates::str::contains("relativo=1"));
 }
+
+#[test]
+fn grep_alinha_o_caminho_com_a_forma_do_argumento() {
+    // #71: o `rg` decidia sozinho -- relativo ao cwd para diretorio sob o
+    // workdir, absoluto para diretorio em --extra-root. Mesma chamada, dois
+    // formatos, e quem consome nao tem como saber qual esperar. Uma auditoria
+    // comparando `glob` (absoluto desde o #60) com `grep` reportou "18 agentes
+    // sem o bloco" quando os 18 tinham: nenhum erro, so resultado errado.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("docs")).unwrap();
+    fs::write(dir.path().join("docs/a.md"), "achar isto\n").unwrap();
+    let raiz = fs::canonicalize(dir.path()).unwrap();
+
+    let s = escreve(
+        dir.path(),
+        &format!(
+            r#"
+print("REL=" + grep("achar", "docs"));
+print("ABS=" + grep("achar", "{raiz}/docs"));
+"#,
+            raiz = raiz.display()
+        ),
+    );
+
+    let esperado_abs = format!("ABS={}/docs/a.md:1:", raiz.display());
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("REL=docs/a.md:1:"))
+        .stdout(predicates::str::contains(esperado_abs));
+}
+
+#[test]
+fn grep_em_extra_root_devolve_absoluto_para_argumento_absoluto() {
+    // Fora do workdir, caminho relativo nem faria sentido: o formato tem que
+    // vir do argumento, nao de onde o diretorio calhou de estar.
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    fs::write(b.path().join("x.md"), "achar isto\n").unwrap();
+    let outro = fs::canonicalize(b.path()).unwrap();
+
+    let s = escreve(a.path(), &format!(r#"print("R=" + grep("achar", "{}"));"#, outro.display()));
+    let esperado = format!("R={}/x.md:1:", outro.display());
+
+    cmd()
+        .args([
+            "run",
+            s.to_str().unwrap(),
+            "--workdir",
+            a.path().to_str().unwrap(),
+            "--extra-root",
+            b.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(esperado));
+}
+
+#[test]
+fn grep_casa_com_glob_no_mesmo_script() {
+    // O teste que reproduz a falha real: comparar o resultado do glob com o do
+    // grep dentro do mesmo script tem que funcionar com padrao absoluto.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("um.md"), "marcador\n").unwrap();
+    fs::write(dir.path().join("dois.md"), "sem nada\n").unwrap();
+    let raiz = fs::canonicalize(dir.path()).unwrap();
+
+    let s = escreve(
+        dir.path(),
+        &format!(
+            r#"
+let arqs = glob("{raiz}/*.md");
+let achados = grep("marcador", "{raiz}");
+let com = 0;
+for a in arqs {{ if achados.contains(a) {{ com += 1; }} }}
+print("com=" + com + " de " + arqs.len());
+"#,
+            raiz = raiz.display()
+        ),
+    );
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("com=1 de 2"));
+}
