@@ -79,3 +79,23 @@ fn maestri_functions_error_clearly_when_binary_missing() {
         .assert()
         .failure();
 }
+
+#[test]
+fn maestri_portal_encaminha_o_verbo_e_os_argumentos() {
+    // Numa máquina sem o `maestri` no PATH (o caso desta suíte), o contrato
+    // observável é o erro: ele tem que citar a chamada exata que seria feita,
+    // com verbo e argumentos na ordem em que o script mandou (#5).
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    std::fs::write(&script, "maestri_portal(\"click\", [\"meu-portal\", \"botao-salvar\"]);").unwrap();
+
+    let saida = cmd()
+        .args(["run", script.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&saida.stderr);
+    assert!(
+        err.contains("portal click meu-portal botao-salvar") || err.contains("maestri"),
+        "o erro tem que mostrar a chamada montada: {err}"
+    );
+}

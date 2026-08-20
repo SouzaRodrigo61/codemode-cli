@@ -134,6 +134,28 @@ fn maestri_note_delete_impl(name: &str) -> Result<String, Box<EvalAltResult>> {
 /// these functions, and let `Command::output()`'s own `NotFound` error
 /// surface a clear message (see `run_maestri`'s `map_err`) instead of
 /// paying to check ahead of time on every run.
+/// `maestri_portal(verbo, args)` -- encaminha `maestri portal <verbo>
+/// <args...>` sem interpretar nada (issue #5).
+///
+/// O que a issue pede e batelada: um roteiro de portal (navega, snapshot,
+/// click, fill, snapshot de novo pra conferir) custa hoje 5 tool-calls
+/// separadas, e vira uma so dentro de um script.
+///
+/// Deliberadamente **generico**, e nao um binding por verbo: o `maestri`
+/// nao esta instalado na maquina onde isto foi escrito, e os bindings deste
+/// modulo tem como regra ter sido conferidos contra o `--help` real antes de
+/// existir. Encaminhar argumento verbatim nao inventa API nenhuma -- serve
+/// snapshot, click, fill, type, key, scroll, wait, evaluate, html, text e
+/// info do mesmo jeito, e o erro que volta e o do proprio maestri. Wrapper
+/// nomeado por verbo pode entrar depois, por quem tiver o binario na mao pra
+/// conferir a ordem dos argumentos.
+fn maestri_portal_impl(verbo: &str, args: rhai::Array) -> Result<String, Box<EvalAltResult>> {
+    let extras: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let mut chamada: Vec<&str> = vec!["portal", verbo];
+    chamada.extend(extras.iter().map(|s| s.as_str()));
+    run_maestri(&chamada)
+}
+
 pub fn register(engine: &mut rhai::Engine) {
     engine.register_fn("maestri_ask", maestri_ask_impl);
     engine.register_fn("maestri_note_read", maestri_note_read_impl);
@@ -141,6 +163,7 @@ pub fn register(engine: &mut rhai::Engine) {
     engine.register_fn("maestri_note_create", maestri_note_create_impl);
     engine.register_fn("maestri_note_delete", maestri_note_delete_impl);
     engine.register_fn("maestri_portal_create", maestri_portal_create_impl);
+    engine.register_fn("maestri_portal", maestri_portal_impl);
     engine.register_fn("maestri_recruit", maestri_recruit_impl);
     engine.register_fn("maestri_connect", maestri_connect_impl);
 }
