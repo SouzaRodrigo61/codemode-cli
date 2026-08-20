@@ -97,3 +97,28 @@ fn bench_fails_clearly_when_measured_script_errors() {
         .assert()
         .failure();
 }
+
+#[test]
+fn bench_nao_grava_telemetria() {
+    // Iteração de benchmark não é uso. Sem isto, medir a performance
+    // envenena o número que o `codemode gain` reporta (#36).
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    std::fs::write(&script, "let x = 1;").unwrap();
+
+    Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .env_remove("CODEMODE_NO_TELEMETRY")
+        .args(["bench", script.to_str().unwrap(), "--workdir"])
+        .arg(dir.path())
+        .args(["--n", "3"])
+        .assert()
+        .success();
+
+    assert!(
+        !home.path().join("runs.jsonl").exists(),
+        "bench não pode gravar execução no histórico que o gain reporta"
+    );
+}
