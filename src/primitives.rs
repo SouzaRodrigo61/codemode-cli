@@ -1064,6 +1064,42 @@ fn parallel_shell_impl(sandbox: &Sandbox, cmds: Array) -> Result<Array, Box<Eval
     Ok(saida)
 }
 
+/// `replace_all_in_glob` (#3): a troca em lote que o mix real pedia -- 27
+/// dos 386 usos medidos eram `edit_file`, quase sempre a mesma edição
+/// repetida arquivo a arquivo. Devolve os caminhos tocados, e cada escrita
+/// passa pela mesma guarda de encolhimento do `write_file`.
+fn replace_all_in_glob_impl(
+    sandbox: &Sandbox,
+    padrao: &str,
+    velho: &str,
+    novo: &str,
+) -> Result<Array, Box<EvalAltResult>> {
+    if velho.is_empty() {
+        return Err(to_err("replace_all_in_glob: o texto a substituir não pode ser vazio"));
+    }
+    let alvos = glob_impl(sandbox, padrao)?;
+    let mut tocados = Array::new();
+    for alvo in alvos {
+        let caminho = alvo.to_string();
+        let atual = match read_file_impl(sandbox, &caminho) {
+            Ok(c) => c,
+            // Binário ou ilegível: não é erro do lote, só não se aplica.
+            Err(_) => continue,
+        };
+        if !atual.contains(velho) {
+            continue;
+        }
+        let novo_conteudo = atual.replace(velho, novo);
+        if sandbox.dry {
+            eprintln!("codemode: [dry-run] replace_all_in_glob -> {caminho}");
+        } else {
+            write_file_guarded(sandbox, &caminho, &novo_conteudo)?;
+        }
+        tocados.push(caminho.into());
+    }
+    Ok(tocados)
+}
+
 pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>, counter: Counter) {
     {
         let allow = allow_hosts;
@@ -1175,6 +1211,16 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>,
         bump(&ct, "parallel_shell");
         parallel_shell_impl(&sb, cmds)
     });
+
+    let sb = sandbox.clone();
+    let ct = counter.clone();
+    engine.register_fn(
+        "replace_all_in_glob",
+        move |padrao: &str, velho: &str, novo: &str| -> Result<Array, Box<EvalAltResult>> {
+            bump(&ct, "replace_all_in_glob");
+            replace_all_in_glob_impl(&sb, padrao, velho, novo)
+        },
+    );
 
     // --- stdlib (#14) ---
     engine.register_fn("join", |a: Array, sep: &str| -> String {
