@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use std::fs;
 use std::time::Duration;
 
@@ -1056,4 +1057,83 @@ fn read_files_conta_uma_primitiva_por_arquivo_na_telemetria() {
     let raw = fs::read_to_string(home.path().join("runs.jsonl")).unwrap();
     let e: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
     assert_eq!(e["prims"]["read_files"], 4, "quatro arquivos, quatro primitivas: {e:?}");
+}
+
+// ---------------------------------------------------------------------------
+// #62 -- limiar de CONTEXTO, separado do --max-output. O default do max-output
+// e 1 MiB (~250k tokens): como defesa contra script desgovernado esta certo,
+// como economia de contexto e inerte, porque a saida media real e 4,7 KB e a
+// guarda nunca dispara.
+// ---------------------------------------------------------------------------
+
+fn script_que_despeja(dir: &std::path::Path, bytes: usize) -> std::path::PathBuf {
+    fs::write(dir.join("g.txt"), "x".repeat(bytes)).unwrap();
+    let s = dir.join("s.rhai");
+    fs::write(&s, r#"print(read_file("g.txt"));"#).unwrap();
+    s
+}
+
+#[test]
+fn saida_acima_do_limiar_de_contexto_avisa_e_nomeia_o_despejo() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = script_que_despeja(dir.path(), 90_000);
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        // O aviso vai pro STDERR de proposito: stdout e a carga que chega ao
+        // contexto, e suja-lo seria trabalhar contra o proprio aviso.
+        .stderr(predicates::str::contains("limiar de contexto"))
+        .stderr(predicates::str::contains("maior impressao unica"));
+}
+
+#[test]
+fn saida_dentro_do_limiar_nao_avisa() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = script_que_despeja(dir.path(), 1_000);
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("limiar de contexto").not());
+}
+
+#[test]
+fn max_context_ajusta_o_limiar_e_zero_desliga() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = script_que_despeja(dir.path(), 90_000);
+    let caminho = s.to_str().unwrap().to_string();
+    let wd = dir.path().to_str().unwrap().to_string();
+
+    // Limiar acima do despejo: nada a avisar.
+    cmd()
+        .args(["run", &caminho, "--workdir", &wd, "--max-context", "200000"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("limiar de contexto").not());
+
+    // Zero desliga o aviso por completo.
+    cmd()
+        .args(["run", &caminho, "--workdir", &wd, "--max-context", "0"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("limiar de contexto").not());
+}
+
+#[test]
+fn aviso_de_contexto_nao_trunca_a_saida() {
+    // Avisar e cortar sao coisas diferentes: cortar esconderia resultado, e o
+    // problema nao e a saida existir, e ninguem saber que ela custou caro.
+    let dir = tempfile::tempdir().unwrap();
+    let s = script_que_despeja(dir.path(), 90_000);
+
+    let out = cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.len() >= 90_000, "saida inteira preservada: {} B", out.stdout.len());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("output truncated"));
 }

@@ -50,9 +50,15 @@ enum Commands {
         /// Each root is confined on its own; there is no path between them.
         #[arg(long = "extra-root")]
         extra_root: Vec<PathBuf>,
-        /// Max bytes of consolidated output before truncation.
+        /// Max bytes of consolidated output before truncation. This is the
+        /// runaway-script guard, not a context budget -- see --max-context.
         #[arg(long = "max-output", default_value_t = 1_048_576)]
         max_output: usize,
+        /// Warn (never truncate) when the script's output passes this many
+        /// bytes. 64 KiB is roughly 16k tokens: past that, a script that
+        /// collapsed ten tool-calls may still be a net loss.
+        #[arg(long = "max-context", default_value_t = 65_536)]
+        max_context: usize,
         /// Print a call log (each primitive invocation) to stderr for debugging.
         #[arg(long)]
         verbose: bool,
@@ -194,6 +200,7 @@ fn main() {
             vm_idle,
             extra_root,
             max_output,
+            max_context,
             verbose,
             strict,
             json,
@@ -201,7 +208,7 @@ fn main() {
             allow_host,
             script_args,
         } => {
-            let opts = RunOpts { timeout, cmd_timeout, vm_idle, extra_root, max_output, verbose, strict, json, dry_run, allow_hosts: allow_host };
+            let opts = RunOpts { timeout, cmd_timeout, vm_idle, extra_root, max_output, max_context, verbose, strict, json, dry_run, allow_hosts: allow_host };
             match run(&script, &workdir, opts, script_args) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
@@ -273,6 +280,7 @@ struct RunOpts {
     vm_idle: u64,
     extra_root: Vec<PathBuf>,
     max_output: usize,
+    max_context: usize,
     verbose: bool,
     strict: bool,
     json: bool,
@@ -281,7 +289,7 @@ struct RunOpts {
 }
 
 fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>) -> Result<i32, String> {
-    let RunOpts { timeout: timeout_secs, cmd_timeout, vm_idle, extra_root, max_output, verbose, strict, json, dry_run, allow_hosts } = opts;
+    let RunOpts { timeout: timeout_secs, cmd_timeout, vm_idle, extra_root, max_output, max_context, verbose, strict, json, dry_run, allow_hosts } = opts;
     let started = Instant::now();
     let (source, origem) = read_script(script_arg, workdir)?;
     let counter = primitives::new_counter();
@@ -456,7 +464,7 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
                 let token = token.to_string();
                 if let Some(msg) = token.strip_prefix("denylist:") {
                     eprintln!("codemode: {msg}");
-                    print_sink(&sink);
+                    print_sink(&sink, max_context);
                     record_run(&meta, &counter, &sink, 1, started);
                     return Ok(1);
                 }
@@ -476,7 +484,7 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
             if json {
                 imprime_json(&counter, &sink, 1, started);
             } else {
-                print_sink(&sink);
+                print_sink(&sink, max_context);
             }
             record_run(&meta, &counter, &sink, 1, started);
             return Ok(1);
@@ -495,7 +503,7 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
     if json {
         imprime_json(&counter, &sink, 0, started);
     } else {
-        print_sink(&sink);
+        print_sink(&sink, max_context);
     }
     record_run(&meta, &counter, &sink, 0, started);
     Ok(0)
@@ -617,6 +625,39 @@ fn record_run(
 /// this machine, none of them were present in the environment. Absence
 /// is not evidence of absence. This value is never used to relax
 /// codemode's own confinement or denylist; those always run regardless.
+/// Aviso de orcamento de CONTEXTO -- separado do `--max-output`, que e a
+/// defesa contra script desgovernado.
+///
+/// O default do `--max-output` e 1 MiB, ~250 mil tokens: como guarda de
+/// seguranca esta certo, como economia de contexto e inerte, porque nenhum
+/// script real chega perto e a guarda nunca dispara (#62). A saida media
+/// medida no uso real e 4,7 KB.
+///
+/// Aqui o limiar e de contexto e o efeito e AVISAR, nunca cortar: cortar
+/// esconderia resultado, e o problema nao e a saida existir, e ninguem saber
+/// que ela custou caro. Vai pro stderr de proposito -- stdout e a carga que
+/// chega ao contexto, e sujar stdout seria trabalhar contra o proprio aviso.
+fn avisa_contexto(s: &primitives::OutputSink, max_context: usize) {
+    if max_context == 0 || s.buf.len() <= max_context {
+        return;
+    }
+    eprintln!(
+        "codemode: aviso: {} B de saida (limiar de contexto: {} B, ~{}k tokens) -- \
+         um script que evita 10 tool-calls e despeja isso no contexto e prejuizo liquido",
+        s.buf.len(),
+        max_context,
+        max_context / 4000
+    );
+    if s.maior_push > 0 {
+        let fatia = s.maior_push * 100 / s.buf.len().max(1);
+        eprintln!(
+            "codemode: a maior impressao unica foi {} B ({}% do total) -- \
+             comece por ela; read_file(caminho, #{{lines: \"i-j\"}}) costuma resolver",
+            s.maior_push, fatia
+        );
+    }
+}
+
 fn detect_host_sandbox() -> Option<String> {
     for var in ["CLAUDE_SANDBOX", "CODEX_SANDBOX", "SANDBOX", "IS_SANDBOX"] {
         if let Ok(v) = std::env::var(var) {
@@ -626,9 +667,10 @@ fn detect_host_sandbox() -> Option<String> {
     None
 }
 
-fn print_sink(sink: &primitives::SharedSink) {
+fn print_sink(sink: &primitives::SharedSink, max_context: usize) {
     let s = sink.lock().unwrap();
     print!("{}", s.buf);
+    avisa_contexto(&s, max_context);
     if s.truncated {
         match &s.spill_path {
             Some(path) => {
