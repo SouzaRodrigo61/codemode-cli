@@ -514,8 +514,31 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
 fn primitiva_unica_como_shell(source: &str) -> Option<String> {
     let at = source.find("run_shell(\"")?;
     let resto = &source[at + "run_shell(\"".len()..];
-    let fim = resto.find('"')?;
-    Some(resto[..fim].to_string())
+    // Para na primeira aspa NÃO escapada. Parar na primeira aspa qualquer
+    // cortava `run_shell("sh -c \"ls -la\"")` em `sh -c \` -- ou seja, o aviso
+    // falhava exatamente quando o comando era não-trivial, que é quando a
+    // sugestão importa (#80). A aspa escapada volta ao literal na sugestão:
+    // quem vai colar no shell quer `sh -c "ls -la"`, não o escape do Rhai.
+    let mut saida = String::new();
+    let mut escapado = false;
+    for c in resto.chars() {
+        if escapado {
+            // Só a aspa e a própria barra são escapes que interessam aqui; o
+            // resto passa como veio, sem inventar interpretação.
+            if c != '"' && c != '\\' {
+                saida.push('\\');
+            }
+            saida.push(c);
+            escapado = false;
+            continue;
+        }
+        match c {
+            '\\' => escapado = true,
+            '"' => return Some(saida),
+            _ => saida.push(c),
+        }
+    }
+    None
 }
 
 /// `--json` (#2): a saída vira dado, não prosa pro modelo reparsear.
