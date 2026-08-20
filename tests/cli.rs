@@ -1176,3 +1176,100 @@ fn modo_json_dentro_do_limiar_nao_marca_over_context() {
     assert_eq!(j["over_context"], false, "{j}");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("limiar de contexto"));
 }
+
+// ---------------------------------------------------------------------------
+// #78 -- `run_shell` lança em exit != 0, nos QUATRO caminhos internos.
+// Antes o contrato era "depende": `sh -c "exit 7"` engolia, `false` engolia,
+// `cargo build` sem Cargo.toml engolia, `git status` fora de repo lançava --
+// acidente de qual arm tratou o erro. Três gates da biblioteca real passavam
+// em silêncio por causa disso.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn run_shell_lanca_no_caminho_do_sh() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(&s, "run_shell(\"sh -c \\\"exit 7\\\"\");\nprint(\"NAO DEVIA CHEGAR AQUI\");\n").unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("falhou (exit 7)"))
+        // A mensagem aponta a saída de emergência, senão quem lê não sabe o
+        // que fazer com um comando que falha de propósito.
+        .stderr(predicates::str::contains("run_shell_full()"))
+        .stdout(predicates::str::contains("NAO DEVIA CHEGAR AQUI").not());
+}
+
+#[test]
+fn run_shell_lanca_no_caminho_nativo_em_processo() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(&s, "run_shell(\"false\");\nprint(\"NAO DEVIA\");\n").unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        // Nomeia o comando, não "comando nativo": quem lê precisa saber qual.
+        .stderr(predicates::str::contains("`false` falhou (exit 1)"));
+}
+
+#[test]
+fn run_shell_full_continua_tolerante() {
+    // A saída de emergência tem que existir, senão o contrato novo só empurra
+    // o problema: quem espera falha precisa de um jeito de decidir.
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(
+        &s,
+        "let r = run_shell_full(\"sh -c \\\"exit 7\\\"\");\nprint(\"exit=\" + r.exit_code + \" ok=\" + r.success);\nprint(\"VIVO\");\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("exit=7 ok=false"))
+        .stdout(predicates::str::contains("VIVO"));
+}
+
+#[test]
+fn run_shell_que_da_certo_segue_devolvendo_a_saida() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(&s, "print(run_shell(\"echo tudo-certo\"));\n").unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("tudo-certo"));
+}
+
+#[test]
+fn erro_de_run_shell_carrega_a_saida_truncada() {
+    // Sem a saída, o erro não diz o que houve. Com a saída inteira, um comando
+    // que despeja 1MB no stderr vira o problema que o #62 evita.
+    let dir = tempfile::tempdir().unwrap();
+    // Script em arquivo em vez de `sh -c` aninhado: o aninhamento de aspas
+    // (Rhai dentro de shell dentro de Rust) é onde o teste erra, não o código.
+    fs::write(
+        dir.path().join("falhar.sh"),
+        "seq 1 400 | sed s/^/linha-de-erro-numero-/\nexit 3\n",
+    )
+    .unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(&s, "run_shell(\"sh falhar.sh\");\n").unwrap();
+
+    let out = cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let erro = String::from_utf8_lossy(&out.stderr);
+    assert!(erro.contains("falhou (exit 3)"), "{erro}");
+    assert!(erro.contains("linha-de-erro-numero-1"), "carrega a saída: {erro}");
+    assert!(erro.contains("saída truncada"), "e trunca: {erro}");
+}
