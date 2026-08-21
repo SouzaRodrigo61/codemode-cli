@@ -212,29 +212,54 @@ MÉTODO QUE MUTA E DEVOLVE ()  -- erro de pré-voo, não aviso
   push/reverse/truncate/pad/crop: mutam a variável; use ela depois, não o retorno
   O idioma certo: `let o = r.stdout; o.trim(); print(o);`
 
+run_shell LANÇA quando o comando falha
+  Exit != 0 aborta o script, em TODOS os caminhos (sh, nativo, rtk).
+  Falha esperada? use run_shell_full, que devolve
+  #{{stdout, stderr, exit_code, success}} e não aborta.
+  Comando que usa exit code como BOOLEANO (`test -f`, `grep -q`, `diff -q`)
+  aborta o script: use a primitiva nativa (path_exists) ou run_shell_full.
+
 PRIMITIVAS
-  read_file  write_file  write_file_force  append_file  edit_file
+  read_file  read_files  write_file  write_file_force  append_file  edit_file
   replace_all_in_glob  glob  grep  path_exists
   run_shell  run_shell_full  run_shell_confirmed  parallel_shell  http_get
   write_file SOBRESCREVE o arquivo inteiro -- pra acrescentar use append_file
-  run_shell_full devolve #{{stdout, stderr, exit_code, success}} pra decidir no script
+  read_file(p, #{{lines: "120-180"}})  só o trecho; 1-based, inclusivo dos dois lados
+  read_files([...])                    mapa caminho -> conteúdo, aceita a mesma faixa
+                                       (paraleliza acima de ~400 arquivos; abaixo é serial)
+
+GLOB
+  glob("docs/*.md")     relativo ao workdir
+  glob("/abs/*.md")     absoluto vale, e devolve caminho absoluto
+  glob("dosc/*.md")     diretório literal que não existe é ERRO, não lista vazia
+  glob("**/*.zzz")      nada casou -> [] (isso continua sendo resposta legítima)
+  grep(padrão, caminho) o formato do caminho na saída segue o do argumento
 
 STDLIB QUE COSTUMAM PROCURAR
   join(lista, sep)  lines(texto)  trimmed(s)  to_json(x)  from_json(s)
   basename(p)  dirname(p)  path_exists(p)
 
 LIMITES
-  --timeout      script inteiro (0 desliga)
-  --cmd-timeout  um comando de shell (0 = espera blocante, sem vigilância)
-  --vm-idle      tempo sem primitiva nenhuma: é o que pega `loop {{}}`
+  --timeout       script inteiro, 30s (0 desliga). Suíte de teste dentro do
+                  script FUNCIONA -- é este que precisa subir: --timeout 300
+  --cmd-timeout   um comando de shell, 600s (0 = espera blocante)
+  --vm-idle       tempo sem primitiva nenhuma: é o que pega `loop {{}}`
+  --max-output    corte de segurança, 1 MiB
+  --max-context   AVISA (não corta) acima de 64 KiB: saída também custa token
+  --strict        recusa script que colapsa menos de 2 primitivas
 
 GIT WORKTREE
   Dentro de um worktree, `.git` é ARQUIVO, não diretório: escrever em
   `.git/QUALQUER_COISA` falha com "not a directory". Use
   `git rev-parse --absolute-git-dir`.
 
-BIBLIOTECA
-  codemode list                  o que este repo já tem
+BIBLIOTECA -- os dois diretórios chamados .codemode
+  ~/.codemode/          estado, criado SOZINHO na 1a execução
+                        runs.jsonl (telemetria) + last.rhai (último script)
+  <repo>/.codemode/     biblioteca, versionada no git, NUNCA criada sozinha:
+                        só `codemode save` a cria. `codemode run` não cria.
+
+  codemode list                  o que este repo já tem -- RODE ANTES de fazer à mão
   codemode save <nome>           promove o último script pra .codemode/
   codemode run <nome>.rhai       roda por nome puro
   codemode check <script>        pré-voo sem executar
