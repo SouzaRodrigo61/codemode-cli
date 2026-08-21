@@ -445,35 +445,42 @@ half-installed — nobody ran `save` there. Becoming a repo asset is a
 deliberate act; if it were automatic, every throwaway script of every
 session would become a versioned file.
 
+```
+codemode list                    # what this repo has, and how often each ran
+codemode save verify --desc "…"  # promote the last script you ran
+codemode run verify.rhai         # run it by bare name
+codemode run review.rhai --arg 77   # ARGS[] makes one script serve many cases
+```
+
+`save` and `list` exist because the measured failure mode is agents rewriting
+the same script every session. `--json` on a run returns `{output, exit_code,
+prims, prim_total, calls_avoided, out_bytes, over_context, ms}` so the next
+step can branch on data instead of scraping text, and
+`replace_all_in_glob(pattern, old, new)` does the bulk edit that was being
+hand-rolled as a loop of `edit_file`, returning the paths it touched.
+
 Because the library is versioned, a one-shot migration for a closed issue
 lives there forever, and every worktree carries a copy. `codemode list`
 marks `obsoleto?` anything with no run in 30+ days — but only when *some*
 script in that folder has history, because otherwise `0x` means "no data",
 not "dead".
 
-## The repo's script library, and when NOT to use codemode
+## When NOT to use it
 
-```
-codemode list                    # what this repo already has, and how often each ran
-codemode save verify --desc "…"  # promote the last script you ran into .codemode/
-codemode run verify.rhai         # run it by bare name
-codemode idioms                  # the Rhai traps that cost the most wasted runs
-```
+One operation. A single read, a single edit, a single command: wrapping it in
+Rhai costs more than the Bash call it replaces.
 
-`save` exists because the measured failure mode is agents rewriting the same
-script every session: of 200 audited runs, only 7% came from a library.
-`list` exists so the library is discoverable at all — an agent that cannot
-see it will rewrite it.
+This is measured, and it is the most common mistake. In the real-usage
+history, **a third of runs used exactly one primitive** — and those failed
+**36%** of the time, against **5.6%** for scripts with three or more. The
+one-liner probe is both the cheapest thing to get wrong and the most likely
+to fail.
 
-A script that collapses **fewer than two primitives** now warns on stderr,
-and `--strict` refuses to run it at all: wrapping a single call in Rhai costs
-more than the Bash call it replaces (17% of audited runs were exactly this).
-Scripts with a loop are exempt — one call in the source can be N at runtime.
-
-`codemode run x.rhai --json` returns `{output, exit_code, prims, prim_total,
-calls_avoided, ms}` instead of raw text, so the next step can branch on data.
-`replace_all_in_glob(pattern, old, new)` does the bulk edit that was being
-hand-rolled as a loop of `edit_file`, and returns the paths it touched.
+So a script collapsing fewer than two primitives warns on stderr, and
+`--strict` refuses to run it at all. A refusal is recorded as a *refusal*,
+not a failure — counting the guard as a failure would mean turning on the
+defence against waste made the numbers worse. Scripts with a loop are exempt:
+one call in the source can be N at runtime.
 
 ## Sandbox / security model
 
@@ -670,13 +677,16 @@ replace to the other two, run a verification command, report. That is
 a measured average — the table at the top of this section is the measured
 part.
 
-## Measuring what it actually saved: `codemode gain`
+## The telemetry behind those numbers
 
 Every run appends one JSON line to `~/.codemode/runs.jsonl` (override with
 `CODEMODE_HOME`, disable with `CODEMODE_NO_TELEMETRY=1`). Metadata only —
 a hash of the source, the per-primitive call counts the engine actually
-dispatched, output bytes, exit code, duration, workdir. Never the source
-itself, never file contents, never command output, never `--arg` values.
+dispatched, the *first word* of each shell command (`git`, `cargo`, `make` —
+which is what answers "what deserves to become a native primitive?"), output
+bytes, exit code, duration, workdir. Never the source itself, never file
+contents, never command output, never command arguments, never `--arg`
+values.
 Writing the log is best-effort: if it fails, the run still succeeds.
 
 ```
