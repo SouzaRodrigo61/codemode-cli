@@ -219,3 +219,69 @@ fn idioms_imprime_a_folha() {
         .stdout(predicates::str::contains("git rev-parse --absolute-git-dir"))
         .stdout(predicates::str::contains("QUANDO NÃO USAR"));
 }
+
+#[test]
+fn list_marca_script_sem_execucao_como_obsoleto() {
+    // #81: `.codemode/` e versionado no repo, entao migracao one-shot fica pra
+    // sempre. Das 9 bibliotecas reais auditadas em 20/08, 4 dos 9 scripts
+    // distintos eram one-shots de issue ja fechada, cada um replicado em 19
+    // worktrees do Orca. Quem roda `codemode list` via o morto ao lado do vivo.
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join(".codemode");
+    fs::create_dir_all(&lib).unwrap();
+    fs::write(lib.join("vivo.rhai"), "// desc: roda\nprint(\"ok\");\n").unwrap();
+    fs::write(lib.join("morto.rhai"), "// desc: one-shot de issue fechada\nprint(\"x\");\n").unwrap();
+
+    // Da historico a biblioteca rodando UM dos scripts: sem isso a guarda de
+    // evidencia cala a marca, que e o comportamento do teste seguinte.
+    Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("run")
+        .arg(lib.join("vivo.rhai"))
+        .arg("--workdir")
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    let out = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("list")
+        .arg("--workdir")
+        .arg(dir.path())
+        .assert()
+        .success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let linha_morto = texto.lines().find(|l| l.contains("morto.rhai")).unwrap();
+    let linha_vivo = texto.lines().find(|l| l.contains("vivo.rhai")).unwrap();
+    assert!(linha_morto.contains("obsoleto?"), "{linha_morto}");
+    assert!(!linha_vivo.contains("obsoleto?"), "{linha_vivo}");
+    assert!(texto.contains("git rm"), "diz o que fazer: {texto}");
+}
+
+#[test]
+fn list_nao_marca_nada_quando_a_biblioteca_inteira_e_sem_historico() {
+    // Se NENHUM script da pasta tem execucao registrada, "0x" nao e sinal de
+    // morte -- e ausencia de dado. A telemetria e local e pode ser mais nova
+    // que a biblioteca. Sem esta guarda, uma pasta com 6 scripts saia com 6
+    // marcas, o que nao informa nada.
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join(".codemode");
+    fs::create_dir_all(&lib).unwrap();
+    fs::write(lib.join("a.rhai"), "// desc: um\nprint(\"a\");\n").unwrap();
+    fs::write(lib.join("b.rhai"), "// desc: dois\nprint(\"b\");\n").unwrap();
+
+    let out = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("list")
+        .arg("--workdir")
+        .arg(dir.path())
+        .assert()
+        .success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!texto.contains("obsoleto?"), "sem evidencia, sem marca: {texto}");
+}

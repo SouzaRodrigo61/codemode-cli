@@ -87,6 +87,50 @@ fn execucoes(nome: &str, entradas: &[telemetry::Entry]) -> usize {
         .count()
 }
 
+/// Epoch da última execução do script, se houve alguma.
+fn ultima_execucao(nome: &str, entradas: &[telemetry::Entry]) -> Option<u64> {
+    entradas
+        .iter()
+        .filter(|e| match &e.name {
+            Some(n) => n == nome || n.ends_with(&format!("/.codemode/{nome}")) || n.ends_with(&format!("/{nome}")),
+            None => false,
+        })
+        .map(|e| e.ts)
+        .max()
+}
+
+/// Dias sem rodar até o script ser marcado como candidato a remoção.
+const DIAS_ATE_OBSOLETO: u64 = 30;
+
+/// Script que nunca rodou, ou que não roda há mais de 30 dias, ganha marca.
+///
+/// Existe porque `.codemode/` é versionado no repo e migração one-shot fica
+/// para sempre: das 9 bibliotecas reais auditadas em 20/08, **4 dos 9 scripts
+/// distintos eram one-shots de issue já fechada** (`issue-723-migrate`,
+/// `issue-725-inspect/migrate/verify`), e cada worktree do Orca carrega uma
+/// cópia -- 19 delas. Quem roda `codemode list` vê o morto ao lado do vivo, com
+/// o mesmo peso (#81).
+///
+/// Marca, não apaga: o dado é fraco de propósito -- a telemetria é local, então
+/// script que só roda no CI de outra máquina aparece como obsoleto aqui. A
+/// decisão é de quem lê.
+///
+/// `biblioteca_tem_historico` evita gritar lobo sem evidência: se NENHUM script
+/// daquela pasta tem execução registrada, "0x" não é sinal de morte, é ausência
+/// de dado -- a telemetria pode ser mais nova que a biblioteca, ou aquele repo
+/// pode nunca ter rodado nesta máquina. Sem essa guarda, uma pasta com 6
+/// scripts saía com 6 marcas, o que não informa nada.
+fn marca_obsoleto(ultima: Option<u64>, agora: u64, biblioteca_tem_historico: bool) -> &'static str {
+    if !biblioteca_tem_historico {
+        return "";
+    }
+    match ultima {
+        None => "  obsoleto?",
+        Some(ts) if agora.saturating_sub(ts) > DIAS_ATE_OBSOLETO * 86_400 => "  obsoleto?",
+        Some(_) => "",
+    }
+}
+
 pub fn list(workdir: &Path) -> Result<i32, String> {
     let dir = workdir.join(".codemode");
     let mut scripts: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
@@ -106,23 +150,44 @@ pub fn list(workdir: &Path) -> Result<i32, String> {
     }
 
     let entradas = telemetry::load();
+    let agora = telemetry::now_secs();
     println!("biblioteca em {}", dir.display());
     println!("{:-<78}", "");
+    // Alguém desta pasta já rodou? Se não, a pasta não tem cobertura de
+    // telemetria e nenhuma marca faz sentido.
+    let tem_historico = scripts.iter().any(|p| {
+        let nome = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        execucoes(&nome, &entradas) > 0
+    });
+    let mut obsoletos = 0;
     for p in &scripts {
         let nome = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let fonte = std::fs::read_to_string(p).unwrap_or_default();
         let n = execucoes(&nome, &entradas);
         let usa_args = fonte.contains("ARGS");
+        let marca = marca_obsoleto(ultima_execucao(&nome, &entradas), agora, tem_historico);
+        if !marca.is_empty() {
+            obsoletos += 1;
+        }
         println!(
-            "  {:<26} {:>4}x{}  {}",
+            "  {:<26} {:>4}x{}{}  {}",
             nome,
             n,
             if usa_args { "  --arg" } else { "       " },
+            marca,
             descricao(&fonte).unwrap_or_else(|| "(sem // desc:)".into())
         );
     }
     println!("{:-<78}", "");
     println!("rode qualquer um por nome puro: codemode run <nome>.rhai");
+    if obsoletos > 0 {
+        println!(
+            "{obsoletos} marcado(s) `obsoleto?`: sem execução há {DIAS_ATE_OBSOLETO}+ dias nesta \
+             máquina.\n  Migração one-shot de issue fechada é o caso comum -- apague com \
+             `git rm .codemode/<nome>.rhai`.\n  A telemetria é local: script que só roda no CI de \
+             outra máquina aparece aqui sem ter morrido."
+        );
+    }
     Ok(0)
 }
 
