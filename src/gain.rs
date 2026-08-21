@@ -29,6 +29,8 @@ struct Agg {
     b3: usize,
     de_biblioteca: usize,
     prims: BTreeMap<String, u64>,
+    /// Verbo de shell -> contagem. Responde "o que merece virar nativo?" (#82).
+    verbos: BTreeMap<String, u64>,
     por_script: BTreeMap<String, usize>,
     /// Bytes que cada script mandou para o contexto. É o que custa token --
     /// tool-call evitada não paga nada por si (#59).
@@ -49,6 +51,7 @@ fn aggregate(entries: &[Entry]) -> Agg {
         b3: 0,
         de_biblioteca: 0,
         prims: BTreeMap::new(),
+        verbos: BTreeMap::new(),
         por_script: BTreeMap::new(),
         bytes_por_script: BTreeMap::new(),
     };
@@ -71,6 +74,9 @@ fn aggregate(entries: &[Entry]) -> Agg {
         }
         for (k, v) in &e.prims {
             *a.prims.entry(k.clone()).or_insert(0) += v;
+        }
+        for (k, v) in &e.prims_shell {
+            *a.verbos.entry(k.clone()).or_insert(0) += v;
         }
         let rotulo = e.name.clone().unwrap_or_else(|| format!("<{}> {}", e.source, e.script));
         *a.por_script.entry(rotulo.clone()).or_insert(0) += 1;
@@ -201,6 +207,19 @@ pub fn run(args: GainArgs) -> Result<i32, String> {
         println!("  {nome:<48} {n:>4}x");
     }
     println!();
+
+    // O que mais roda pelo shell é a pergunta que decide qual primitiva nativa
+    // vale construir. Sem esta lista, a escolha era intuição (#82).
+    if !a.verbos.is_empty() {
+        println!("Comandos de shell mais rodados");
+        println!("{:-<78}", "");
+        let mut verbos: Vec<_> = a.verbos.iter().collect();
+        verbos.sort_by(|x, y| y.1.cmp(x.1));
+        for (verbo, n) in verbos.iter().take(10) {
+            println!("  {verbo:<24} {n:>6}");
+        }
+        println!();
+    }
 
     // Um script que evita 10 tool-calls e despeja 200KB no contexto é
     // prejuízo líquido. Sem esta lista o relatório o exibia como vitória.

@@ -30,6 +30,11 @@ pub struct Entry {
     /// Contagem por primitiva, vinda dos próprios pontos de registro do
     /// engine — o que foi de fato despachado, não regex sobre o fonte.
     pub prims: BTreeMap<String, u64>,
+    /// Verbo de shell -> contagem (`git`, `cargo`, `make`). Só a primeira
+    /// palavra: é o que responde "o que merece virar primitiva nativa?" sem
+    /// carregar argumento nenhum (#82).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prims_shell: BTreeMap<String, u64>,
     pub prim_total: u64,
     pub out_bytes: u64,
     pub exit_code: i32,

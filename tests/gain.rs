@@ -362,3 +362,47 @@ fn relatorio_expoe_bytes_por_execucao_e_maiores_despejos() {
     assert!(texto.contains("Maiores despejos de contexto"), "{texto}");
     assert!(texto.contains("s.rhai"), "o despejador é nomeado: {texto}");
 }
+
+#[test]
+fn telemetria_grava_o_verbo_do_shell_e_nao_o_argumento() {
+    // #82: o runs.jsonl sabia que houve 6 `run_shell` e nada sobre o que eles
+    // rodaram, entao nao havia como responder "qual comando merece virar
+    // primitiva nativa?". O `read_files` do #63 foi escolhido por intuicao e a
+    // medicao depois mostrou que so paga acima de 400 arquivos.
+    let home = tempfile::tempdir().unwrap();
+    let dir = dir_de_trabalho("verbos");
+    run_in(
+        home.path(),
+        &dir,
+        r#"run_shell("echo um"); run_shell("git --version"); run_shell("echo dois");"#,
+    )
+    .success();
+
+    let l = linhas(home.path());
+    let verbos = &l[0]["prims_shell"];
+    assert_eq!(verbos["echo"], 2, "{verbos:?}");
+    assert_eq!(verbos["git"], 1, "{verbos:?}");
+}
+
+#[test]
+fn verbo_do_shell_e_so_a_primeira_palavra_sem_caminho_nem_argumento() {
+    // A regra de privacidade da telemetria continua valendo: metadado, nunca
+    // conteudo. `sh -c "curl -H Authorization: ..."` grava `sh`, e o caminho
+    // do binario vira basename -- o diretorio diria onde as coisas estao
+    // instaladas, que e mais do que a pergunta precisa.
+    let home = tempfile::tempdir().unwrap();
+    let dir = dir_de_trabalho("verbos_privacidade");
+    run_in(
+        home.path(),
+        &dir,
+        r#"run_shell("/bin/echo com-caminho"); run_shell_full("sh -c \"echo segredo-nao-vaza\"");"#,
+    )
+    .success();
+
+    let l = linhas(home.path());
+    let bruto = serde_json::to_string(&l[0]["prims_shell"]).unwrap();
+    assert!(bruto.contains("\"echo\""), "basename, nao caminho: {bruto}");
+    assert!(!bruto.contains("/bin/"), "caminho nao entra: {bruto}");
+    assert!(bruto.contains("\"sh\""), "{bruto}");
+    assert!(!bruto.contains("segredo"), "argumento NUNCA entra: {bruto}");
+}
