@@ -1,6 +1,7 @@
 //! Pré-voo, stdlib, `check` e `--dry-run` (#13, #14, #15, #16, #17).
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use std::fs;
 use std::path::Path;
 
@@ -356,4 +357,83 @@ fn sugestao_de_primitiva_unica_trunca_comando_longo() {
         .unwrap_or_else(|| panic!("sem linha de sugestao: {erro}"));
     assert!(linha.contains("..."), "truncou: {linha}");
     assert!(!linha.contains(&"a".repeat(100)), "nao despeja o comando inteiro: {linha}");
+}
+
+#[test]
+fn avisa_quando_run_shell_repete_o_comando_do_run_shell_full() {
+    // #83: o antipadrao estava em 4 dos 9 scripts das bibliotecas reais desta
+    // maquina. Nao e estilo -- em `verify.rhai` roda a suite de testes DUAS
+    // VEZES, porque `run_shell_full` ja devolveu `.stdout` e quem escreveu
+    // chamou de novo so pra imprimir.
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(
+        &s,
+        "let r = run_shell_full(\"echo um\");\nif r.success {\n    print(run_shell(\"echo um\"));\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("repete o comando da linha 1"))
+        .stderr(predicates::str::contains("print(r.stdout)"));
+}
+
+#[test]
+fn avisa_tambem_quando_o_segundo_comando_e_prefixo_do_primeiro() {
+    // O caso real do `verify.rhai`: `cargo test --workspace` e depois
+    // `cargo test`. Nao e o mesmo comando, mas roda a mesma suite de novo.
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(
+        &s,
+        "let r = run_shell_full(\"echo um dois\");\nprint(run_shell(\"echo um\"));\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("repete o comando"));
+}
+
+#[test]
+fn nao_avisa_quando_os_comandos_so_compartilham_a_primeira_palavra() {
+    // O `worktree.rhai` faz `git fetch origin main` e depois
+    // `git worktree list`. Mesma primeira palavra, comandos diferentes: casar
+    // por primeira palavra transformaria a dica em ruido.
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(
+        &s,
+        "let r = run_shell_full(\"echo um\");\nprint(run_shell(\"echo dois\"));\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("repete o comando").not());
+}
+
+#[test]
+fn nao_avisa_quando_os_dois_sao_run_shell_full() {
+    // Usar a versao tipada duas vezes e decidir duas vezes, nao reimprimir.
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path().join("s.rhai");
+    fs::write(
+        &s,
+        "let a = run_shell_full(\"echo um\");\nlet b = run_shell_full(\"echo um\");\nprint(\"\" + a.success + b.success);\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("repete o comando").not());
 }

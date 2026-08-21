@@ -350,6 +350,79 @@ pub fn foreign_idiom_hints(source: &str) -> Vec<&'static str> {
 
 /// Compila, resolve símbolo e roda os linters. Erro aqui aborta antes da
 /// primeira primitiva -- nenhum side-effect.
+/// Literal que vem logo depois de `nome("`, até a primeira aspa não escapada.
+/// Concatenação (`run_shell("make " + alvo)`) devolve só o pedaço literal --
+/// que é o suficiente, porque os dois lados do antipadrão têm o mesmo.
+fn argumento_literal(linha: &str, nome: &str) -> Option<String> {
+    let marca = format!("{nome}(\"");
+    let at = linha.find(&marca)?;
+    let resto = &linha[at + marca.len()..];
+    let mut saida = String::new();
+    let mut escapado = false;
+    for c in resto.chars() {
+        if escapado {
+            saida.push(c);
+            escapado = false;
+            continue;
+        }
+        match c {
+            '\\' => escapado = true,
+            '"' => return Some(saida.trim().to_string()),
+            _ => saida.push(c),
+        }
+    }
+    None
+}
+
+/// `a` é prefixo de `b` em fronteira de palavra? `cargo test` é prefixo de
+/// `cargo test --workspace`; `git fetch` NÃO é prefixo de `git worktree list`.
+fn prefixo_de_comando(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (curto, longo) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    if curto.is_empty() {
+        return false;
+    }
+    longo.strip_prefix(curto).map(|r| r.starts_with(' ')).unwrap_or(false)
+}
+
+/// Antipadrão "roda duas vezes": `run_shell_full(X)` e, logo abaixo,
+/// `run_shell(X)` só para imprimir -- quando `run_shell_full` já devolveu
+/// `.stdout`.
+///
+/// Não é estilo: em `verify.rhai` isso roda a suíte de testes DUAS VEZES.
+/// Estava em 4 dos 9 scripts das bibliotecas reais desta máquina, incluindo o
+/// `ci.rhai` deste repo antes do #77 -- ou seja, todo mundo cai nele (#83).
+fn roda_duas_vezes(source: &str) -> Vec<String> {
+    const JANELA: usize = 8;
+    let linhas: Vec<&str> = source.lines().collect();
+    let mut avisos = Vec::new();
+    for (i, linha) in linhas.iter().enumerate() {
+        let Some(cmd_full) = argumento_literal(linha, "run_shell_full") else { continue };
+        for (j, adiante) in linhas.iter().enumerate().skip(i + 1).take(JANELA) {
+            // `run_shell_full` de novo não é o antipadrão: quem usa a versão
+            // tipada duas vezes está decidindo duas vezes, não reimprimindo.
+            if adiante.contains("run_shell_full(") {
+                continue;
+            }
+            let Some(cmd) = argumento_literal(adiante, "run_shell") else { continue };
+            if prefixo_de_comando(&cmd_full, &cmd) {
+                avisos.push(format!(
+                    "linha {}: `run_shell(\"{}...\")` repete o comando da linha {} -- \
+                     `run_shell_full` já devolveu `.stdout`, use `print(r.stdout)` \
+                     (rodar de novo custa o comando inteiro outra vez)",
+                    j + 1,
+                    cmd.chars().take(24).collect::<String>(),
+                    i + 1
+                ));
+                break;
+            }
+        }
+    }
+    avisos
+}
+
 pub fn check(engine: &Engine, source: &str) -> Result<Report, Vec<String>> {
     let ast = match engine.compile(source) {
         Ok(ast) => ast,
@@ -406,6 +479,7 @@ pub fn check(engine: &Engine, source: &str) -> Result<Report, Vec<String>> {
     let mut avisos: Vec<String> =
         foreign_idiom_hints(source).into_iter().map(str::to_string).collect();
     avisos.extend(shell_com_equivalente(source));
+    avisos.extend(roda_duas_vezes(source));
     Ok(Report {
         prim_calls,
         has_loop: has_loop(&ast),
