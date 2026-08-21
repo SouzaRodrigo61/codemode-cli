@@ -30,7 +30,12 @@ if ARGS.len() < 1 {
             continue;
         }
         write_file(tmp, body);
-        let r = run_shell_full("gh issue create" + repo_flag + " --title \"" + title + "\" --body-file " + tmp);
+        // Aspa dupla no titulo fechava a string do shell e o `gh` recebia
+        // argumento picado -- foi 1 falha em 6 ao abrir as issues da auditoria
+        // de 20/08 (#84). O `gh` nao tem `--title-file`, entao escapar e a
+        // saida: `replaced` (nao `replace`, que muta e devolve unit).
+        let titulo_seguro = replaced(title, "\"", "\\\"");
+        let r = run_shell_full("gh issue create" + repo_flag + " --title \"" + titulo_seguro + "\" --body-file " + tmp);
         if r.success {
             criadas += 1;
             print("ok   " + title + " -> " + r.stdout);
