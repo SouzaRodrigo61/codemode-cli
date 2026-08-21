@@ -14,16 +14,43 @@ Not an MCP server. Not a resident process. No `@modelcontextprotocol/sdk`,
 no protocol handshake, nothing to register. It is a compiled binary you
 invoke via `Bash`/`exec`, same as [`rtk`](https://github.com/SouzaRodrigo61/rtk): it runs, does the work, exits, frees memory.
 
-Not tied to any one workspace or agent product, either. The core primitives
-(`read_file`/`write_file`/`edit_file`/`run_shell`/`grep`/`glob`) have no
-dependency on Claude Code, Codex, Grok Build, OpenCode, Maestri, Cursor, or
-anything else — they're plain file/shell operations. Support for a
-particular external tool (currently: Maestri, see below) lives in its own
-module and is only registered into a script's namespace when that tool is
-actually detected on the machine (`command -v maestri` succeeding, checked
-at every `codemode` invocation). Point `codemode` at a Cursor project or a
-Devin sandbox tomorrow and it works identically — it just won't expose
-`maestri_*` functions there, because there's nothing to shell out to.
+Not tied to any workspace or agent product either. The primitives are plain
+file and shell operations with no dependency on Claude Code, Codex, Grok
+Build, OpenCode, Maestri or Cursor. Integration with a specific external
+tool (currently only Maestri) lives in its own module and is registered
+into a script's namespace **only when that tool is detected on the
+machine**, checked at every invocation — so the same binary in a Cursor
+project simply doesn't expose `maestri_*`, because there is nothing there
+to shell out to.
+
+## Host-agnostic, and what follows from it
+
+Today Orca, tomorrow Cursor, then a Devin sandbox, then super.engineering,
+then just the Claude Code terminal. The binary doesn't care: it's on
+`PATH`, you invoke it, it exits.
+
+That portability has a consequence worth stating, because it is easy to
+get wrong: **the knowledge about codemode has to live in the binary, not
+in the host's context files.**
+
+```bash
+codemode            # what it does and which subcommands exist
+codemode idioms     # syntax, primitives, limits, traps — always current
+codemode list       # this repo's library
+```
+
+A skill, a `CLAUDE.md`, an `AGENTS.md` or a persona prompt is specific to
+one host and gets left behind when you switch. Worse, any of them that
+*copies* the API surface goes stale and starts lying. That has happened
+three times in this project: persona prompts carrying the pre-throw
+`run_shell` contract, a local gate advertising a `clippy` check it never
+ran, and the same outdated timeout rule sitting in 28 files under three
+different phrasings.
+
+So: host files may **point** at `codemode idioms`; they must not mirror
+it. And if you change a primitive's contract, update `idioms` in the same
+PR — a test fails if the sheet stops mentioning the behaviours that change
+how a script must be written.
 
 ## How it works
 
@@ -38,8 +65,21 @@ Devin sandbox tomorrow and it works identically — it just won't expose
   new tool.
 
 ```
-codemode run <script.rhai> [--workdir DIR] [--timeout SECS] [--max-output BYTES] [--verbose]
+codemode run <script.rhai> [--workdir DIR] [--timeout SECS] [--verbose]
 codemode run -                          # read the script from stdin
+codemode run x.rhai --arg 77 --arg foo  # available as the ARGS array
+codemode check x.rhai                   # pre-flight, without running
+codemode run x.rhai --dry-run           # announce every write and command, do none
+codemode run x.rhai --strict            # refuse a script collapsing fewer than 2 primitives
+```
+
+Two output limits, with different jobs:
+
+```
+--max-output BYTES    hard cap, 1 MiB. Truncates, and spills the full
+                      stream to a temp file named in the notice.
+--max-context BYTES   soft threshold, 64 KiB. Warns on stderr and names
+                      the largest single print; never truncates.
 ```
 
 ## Install
@@ -126,6 +166,17 @@ one actually seen in real production review scripts).
 
 - `read_file(path) -> String` — errors clearly if the file doesn't exist
   or isn't valid UTF-8.
+- `read_file(path, #{lines: "120-180"}) -> String` — only that slice.
+  1-based and inclusive on both ends, like an editor and like
+  `sed -n 'i,jp'`, not like a Rust slice. The cut happens on the Rust
+  side and *stops* at the end line, so the rest of the file is never
+  materialised. On a 1.3 MB file, taking 20 lines went from 1,348,894 B
+  to 1,386 B per read.
+- `read_files([path, ...]) -> Map` — reads the whole list and returns a
+  map path → contents; takes the same `#{lines: ...}` option. Parallel
+  above ~400 files, serial below it, because that is where the measured
+  crossover is (see *Benchmark*). A map rather than an array so the
+  caller never has to match by index.
 - `write_file(path, content)` — creates parent directories as needed.
   **Refuses** to replace an existing file with content less than half its
   size: that shape is a wipe, not an update (see *Known traps* below).
@@ -333,16 +384,29 @@ Paid for already — don't rediscover them:
   change part of a file, and run a batch on ONE file before running it on
   all of them. `write_file`'s shrink guard now refuses the wipe shape, but
   the guard is the backstop, not the plan.
-- **30s watchdog.** Default timeout is 30s (hard cap 120s). Test suites
-  and builds belong in the shell directly, not inside a script.
+- **Three independent guards, not one watchdog.** `--timeout` bounds the
+  whole script (30s default, no hard cap — raise it); `--cmd-timeout`
+  bounds a single shell command (600s default); `--vm-idle` catches a pure
+  VM loop that never dispatches a primitive. Because `--cmd-timeout` is
+  generous, **a test suite inside a script works** — what you raise is the
+  global one: `codemode run ci.rhai --timeout 300`. An earlier version of
+  this README said suites belonged outside the script; that was true when
+  the single 30s watchdog was all there was.
 - **Rhai is not JavaScript and not Rust.** No single-quoted strings and no
   `${}` interpolation outside backtick strings; functions are `fn`, not
   `function`; closures are `|x| expr`, not `x => expr`; no `let mut`, no
   `format!`, no `console.log`, no `require`/`import`. A failing script
   prints targeted hints for these.
-- **`run_shell_full(cmd)`** returns `#{stdout, stderr, exit_code,
-  success}` — use it when the script has to branch on the result;
-  `run_shell` errors on failure instead.
+- **`run_shell` aborts the script when the command fails** (non-zero
+  exit), in every internal path — `sh`, in-process, RTK-routed. Before
+  this was made uniform, the behaviour depended on which path handled the
+  command: `git status` outside a repo threw while `cargo build` without a
+  `Cargo.toml` was swallowed. Use **`run_shell_full(cmd)`** when failure is
+  expected and the script must decide: it returns `#{stdout, stderr,
+  exit_code, success}` and never aborts. Watch out for commands that use
+  the exit code as a *boolean* (`test -f`, `grep -q`, `diff -q`) — those
+  now abort; reach for the native primitive (`path_exists`) or
+  `run_shell_full`.
 - **Glob metacharacters in literal directory names** (`[id]`, `?`) are
   interpreted as patterns, so `glob("[id]/*.md")` matches nothing rather
   than the directory literally named `[id]`.
@@ -357,7 +421,35 @@ re-deriving (and duplicating) the same script from scratch. That
 duplication is the field-reported failure mode of code mode across
 sessions (issue #9). Only bare names fall back; an explicit path that
 doesn't exist fails loudly, never silently swapped for a library file.
-Check `.codemode/` before writing a new script.
+Run `codemode list` before writing a new script — or before doing anything
+by hand. That habit *is* the adoption gap: in one real session, `cargo
+test`, `clippy`, `git commit/push` and `gh pr view` were run by hand dozens
+of times while `ci.rhai` and `ship.rhai` sat versioned in the repo.
+
+**Two different directories share the name `.codemode`:**
+
+```
+~/.codemode/        state. Created automatically on the first run.
+                      runs.jsonl   telemetry, one line per run
+                      last.rhai    the last script that came from stdin
+                    Honours $CODEMODE_HOME.
+
+<repo>/.codemode/   the library. Versioned in git. NEVER created
+                    automatically — `codemode run` does not create it.
+                    Only `codemode save <name>` does.
+```
+
+That surprises people: running a script inside a repo does **not** give
+that repo a library. A repo without `.codemode/` isn't broken or
+half-installed — nobody ran `save` there. Becoming a repo asset is a
+deliberate act; if it were automatic, every throwaway script of every
+session would become a versioned file.
+
+Because the library is versioned, a one-shot migration for a closed issue
+lives there forever, and every worktree carries a copy. `codemode list`
+marks `obsoleto?` anything with no run in 30+ days — but only when *some*
+script in that folder has history, because otherwise `0x` means "no data",
+not "dead".
 
 ## The repo's script library, and when NOT to use codemode
 
@@ -497,24 +589,86 @@ Run it:
 codemode run examples/bump_version.rhai --workdir examples
 ```
 
-## Measured tool-call reduction
+## What it actually saved, on real work
 
-Task: read 3 config files, extract a constant (`VERSION`) from one of
-them, apply the same replace to the other two, run a verification
-command, report the result. This is `examples/bump_version.rhai` above,
-run against `examples/fixtures/{a,b,c}.conf`.
+The honest number is the one from **real work**, with benchmark runs and
+the tool's own development excluded. On the machine this was measured
+(`~/.codemode/runs.jsonl`, August 2026):
 
-- **(a) via codemode:** `codemode run examples/bump_version.rhai
-  --workdir examples` — **1 tool-call** (`Bash`). Verified working:
-  `a.conf` stays `VERSION=1.0.0`, `b.conf`/`c.conf` become
-  `VERSION=1.0.1`, exit code `0`, verification output `2` (both files
-  match the new version).
-- **(b) equivalent without codemode**, same task, one tool-call per
-  operation: `Read(a.conf)`, `Read(b.conf)`, `Read(c.conf)`,
-  `Edit(b.conf)`, `Edit(c.conf)`, `Bash(grep verification)` —
-  **6 tool-calls**.
+| | before | after |
+|---|---:|---:|
+| real runs recorded | 9 | **36** |
+| tool-calls avoided | 121 | **770** |
+| failure rate | 30% | **13.9% lifetime · 5.0% rolling** |
+| output per run | 4,549 B | **2,310 B** |
 
-**6 → 1, an 83% reduction in tool-calls for this task.**
+Output per run is the line that matters most: **bytes of context are what
+cost tokens**, not tool-calls avoided. A script that collapses ten calls
+and dumps 200 KB into the context is a net loss.
+
+Two caveats stated up front, because a benchmark that flatters itself is
+how this tool got into trouble in the first place:
+
+- The jump from 121 to 770 avoided calls is partly accounting:
+  `read_files` counts one primitive per file, which is the honest way to
+  count what it replaced, but it is not all new work.
+- Those numbers *are* the whole real-usage history on one machine. They
+  are small. They are also the only ones not inflated by benchmark runs —
+  see below for how badly that can go.
+
+### The measurement that had to be fixed first
+
+`codemode gain` used to sum everything. Of 1,312 recorded runs, **1,303
+were the tool benchmarking and developing itself** and 9 were product
+work. The report inflated the gain **145×** and hid a 30% real failure
+rate behind the benchmark's 0.15%:
+
+```
+Execuções:                1308      <- benchmark + real, summed
+Tool-calls evitadas:     57524      <- the real number was 121
+Falhas:                      4  (0.3%)   <- it was 30%
+```
+
+Every run is now classified at write time (`kind`: real / bench / self /
+check / refused), by rules that carry no machine-specific path list: a
+script under `bench/`, a workdir in a temp root, or a workdir whose
+`Cargo.toml` declares this crate. A legacy line whose workdir no longer
+exists is reported as **unclassifiable**, never assumed to be real — of
+36 such lines, 27 turned out to be deleted development worktrees.
+
+### Per-feature, measured
+
+| change | gain | condition |
+|---|---|---|
+| `read_file` with a line range | **973× fewer bytes**, 2.45× faster | reading part of a large file |
+| `read_files` | 1.20× at 800 files, **1.40×** at 2,000 | only above ~400 files |
+| library script vs. inline | **~60× cheaper per invocation** | ~10 tokens vs. 300–800 to author |
+
+### And one honest negative
+
+The agent-audit script in a companion repo was rewritten to use the new
+primitives, to demonstrate the gain. It got **2× slower** — 16.7 ms
+against 7.8 ms — because two directory-wide `grep` calls cost far more
+than reading 44 small files. A single `read_files` of the whole files
+merely tied. The script was reverted, with the measurement recorded in its
+header so nobody repeats the attempt believing it is an improvement.
+
+**The primitives above only pay past roughly 400 files.** Below that, the
+straightforward path wins.
+
+### The illustrative example
+
+Task: read 3 config files, extract `VERSION` from one, apply the same
+replace to the other two, run a verification command, report. That is
+`examples/bump_version.rhai`, run against `examples/fixtures/{a,b,c}.conf`.
+
+- **via codemode:** one `Bash` tool-call.
+- **without it:** `Read(a)`, `Read(b)`, `Read(c)`, `Edit(b)`, `Edit(c)`,
+  `Bash(grep)` — six tool-calls.
+
+**6 → 1 for this task.** Treat it as an illustration of the shape, not as
+a measured average — the table at the top of this section is the measured
+part.
 
 ## Measuring what it actually saved: `codemode gain`
 
@@ -531,11 +685,30 @@ codemode gain --history    # the last runs, one per line
 codemode gain --json       # the aggregate, for scripting
 ```
 
-The buckets are the point. A script with 3+ primitives is a real collapse;
-one with a single primitive cost *more* than the equivalent `Bash` call —
-that bucket is measured waste, not a rounding error. The first audit of
-this tool (200 real runs) found 17% of runs in it, and 18% of runs failing
-outright. Without this log, none of that was knowable; it had to be
+```
+codemode gain --bench      # the excluded segment, instead of real work
+codemode gain --janela 0   # turn the rolling window off
+```
+
+Three things in that report earn their place:
+
+- **Real work by default.** Benchmark runs, scratch scripts in a temp
+  directory and the tool developing itself are reported separately. Runs
+  refused by a guard (`--strict`) get their own `kind` and are *not*
+  counted as failures — counting them meant that turning on the defence
+  against waste made the failure rate worse.
+- **Lifetime rate next to a rolling window.** A failure from three weeks
+  ago weighs the same as today's, forever. With 5 historical failures in
+  33 runs, the lifetime rate only drops below 5% after 68 consecutive
+  clean runs — the target stops being a target and becomes a wait. The
+  window answers the other question: *are we getting better?*
+- **The buckets.** A script with 3+ primitives is a real collapse; one
+  with a single primitive cost *more* than the equivalent `Bash` call.
+  That bucket is measured waste, and it correlates with failure hard: in
+  the real history, single-primitive scripts failed **36%** of the time
+  against **5.6%** for scripts with three or more.
+
+Without this log none of that was knowable; the first audit had to be
 reverse-engineered out of the host CLI's transcripts.
 
 ## Tests
@@ -552,6 +725,10 @@ reverse-engineered out of the host CLI's transcripts.
   runs it when confirmed
 - infinite loop (`loop { }`) is killed by the timeout (exit code `124`)
 - output beyond `--max-output` is truncated with a stderr notice, and the full stream spills to a temp file named in that notice (with tail preview)
+- output beyond `--max-context` warns without truncating, in both plain and `--json` mode, and the JSON carries `out_bytes` / `over_context` / `largest_print`
+- `run_shell` aborts on a non-zero exit in all four internal paths, while `run_shell_full` stays tolerant
+- `glob` handles absolute patterns, reaches `--extra-root`, and errors on a named directory that doesn't exist instead of returning an empty list
+- `codemode idioms` still mentions every behaviour that changes how a script must be written
 - stdin script input (`codemode run -`) works end to end
 
 ## Benchmark: codemode vs. native tool-calls
