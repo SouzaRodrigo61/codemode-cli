@@ -353,7 +353,7 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
         );
         if strict {
             eprintln!("codemode: --strict: recusado sem executar");
-            record_run(&meta, &counter, &sink, 2, started);
+            record_run_com_kind(&meta, &counter, &sink, 2, started, Some(KIND_RECUSADO));
             return Ok(2);
         }
     }
@@ -657,12 +657,34 @@ struct RunMeta {
 /// Grava a linha de telemetria. Chamada em TODA saída de `run` -- inclusive
 /// nas de falha, porque a taxa de erro é justamente um dos números que o
 /// relatório existe para expor (issue #11/#12).
+/// Recusa de GUARDA -- o script nem rodou porque a ferramenta decidiu que não
+/// valia a pena. Não é falha: é a guarda funcionando.
+///
+/// Sem isto, `--strict` era contraproducente: recusar gravava exit=2, que o
+/// `gain` contava como falha, então ligar a defesa contra desperdício PIORAVA
+/// a taxa de falha -- o número que se quer baixar (#95).
+///
+/// Erro de pré-voo (sintaxe, função que não existe) continua sendo falha de
+/// verdade: ali quem errou foi quem escreveu o script.
+const KIND_RECUSADO: &str = "recusado";
+
 fn record_run(
     meta: &RunMeta,
     counter: &primitives::Counter,
     sink: &primitives::SharedSink,
     exit_code: i32,
     started: Instant,
+) {
+    record_run_com_kind(meta, counter, sink, exit_code, started, None)
+}
+
+fn record_run_com_kind(
+    meta: &RunMeta,
+    counter: &primitives::Counter,
+    sink: &primitives::SharedSink,
+    exit_code: i32,
+    started: Instant,
+    kind: Option<&str>,
 ) {
     let prims: std::collections::BTreeMap<String, u64> =
         counter.lock().map(|m| m.clone()).unwrap_or_default();
@@ -682,7 +704,7 @@ fn record_run(
         exit_code,
         ms: started.elapsed().as_millis() as u64,
         workdir: meta.workdir.clone(),
-        kind: Some(meta.kind.clone()),
+        kind: Some(kind.map(|k| k.to_string()).unwrap_or_else(|| meta.kind.clone())),
     });
 }
 

@@ -110,8 +110,14 @@ pub fn run(args: GainArgs) -> Result<i32, String> {
     // Linha antiga cujo workdir sumiu não é contada como real nem como bench --
     // aparece com nome próprio, para a incerteza ficar visível em vez de virar
     // número.
-    let (desconhecidas, outros): (Vec<Entry>, Vec<Entry>) =
+    let (desconhecidas, resto): (Vec<Entry>, Vec<Entry>) =
         resto.into_iter().partition(|e| e.kind() == "desconhecido");
+    // Recusa de guarda não é falha nem trabalho: é a ferramenta dizendo "não
+    // vale a pena rodar isso". Contar à parte deixa visível se a guarda está
+    // trabalhando -- e foi contá-la como falha que tornava `--strict`
+    // contraproducente (#95).
+    let (recusadas, outros): (Vec<Entry>, Vec<Entry>) =
+        resto.into_iter().partition(|e| e.kind() == "recusado");
     let escolhidas = if args.bench { &outros } else { &reais };
     let a = aggregate(escolhidas);
 
@@ -127,6 +133,12 @@ pub fn run(args: GainArgs) -> Result<i32, String> {
             println!(
                 "  Não classificáveis: {} (linha anterior ao #59 com workdir já apagado --\n   sem o diretório não há como provar o que era, e chutar infla o número)",
                 desconhecidas.len()
+            );
+        }
+        if !args.bench && !recusadas.is_empty() {
+            println!(
+                "  Recusadas pela guarda: {} (--strict: nem rodou, e não é falha)",
+                recusadas.len()
             );
         }
         if !args.bench && !outros.is_empty() {
@@ -170,6 +182,12 @@ pub fn run(args: GainArgs) -> Result<i32, String> {
         println!(
             "Não classificáveis:   {:>8}  (linha anterior ao #59 com workdir já apagado)",
             desconhecidas.len()
+        );
+    }
+    if !args.bench && !recusadas.is_empty() {
+        println!(
+            "Recusadas pela guarda:{:>8}  (--strict: nem rodou, e não é falha)",
+            recusadas.len()
         );
     }
     println!("Execuções:            {:>8}", a.runs);
