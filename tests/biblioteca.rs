@@ -285,3 +285,28 @@ fn list_nao_marca_nada_quando_a_biblioteca_inteira_e_sem_historico() {
     let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(!texto.contains("obsoleto?"), "sem evidencia, sem marca: {texto}");
 }
+
+#[test]
+fn idioms_cobre_o_que_muda_o_comportamento_do_script() {
+    // `codemode idioms` mora no binario de proposito: CLAUDE.md, AGENTS.md e
+    // skills nao sao herdados por subagente nem lidos por Codex/Grok, mas o
+    // binario esta no PATH de todo mundo. E o unico canal cross-modelo -- e
+    // por isso e o que MAIS custa quando esta desatualizado: ate 20/08 ele
+    // nao dizia que `run_shell` lanca (#78), entao quem seguisse o texto
+    // escrevia script que quebra, com confianca.
+    let out = Command::cargo_bin("codemode").unwrap().arg("idioms").assert().success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    for esperado in [
+        "run_shell LANÇA",          // #78: mudanca de contrato
+        "run_shell_full",           // a saida de emergencia
+        "read_files",               // #63
+        "lines: \"120-180\"",       // #61
+        "--max-context",            // #62
+        "diretório literal que não existe é ERRO", // #72
+        "NUNCA criada sozinha",     // a distincao entre os dois .codemode
+        "codemode list",            // o habito que fecha o gap de adocao
+    ] {
+        assert!(texto.contains(esperado), "`idioms` não menciona {esperado:?}:\n{texto}");
+    }
+}
