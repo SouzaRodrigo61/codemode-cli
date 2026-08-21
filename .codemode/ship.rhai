@@ -44,7 +44,12 @@ if ARGS.len() < 1 {
                 if !p.success {
                     print("FALHA no push: " + p.stderr);
                 } else {
-                    let pr = run_shell_full("gh pr create --title \"" + assunto + "\" --body-file " + corpo_pr);
+                    // Mesma armadilha que o #84 corrigiu no open-issues.rhai,
+                    // e que me pegou de verdade: assunto com aspas duplas
+                    // fecha a string do shell e o `gh` recebe argumento picado.
+                    // `replaced`, nao `replace` -- o segundo muta e devolve unit.
+                    let assunto_seguro = replaced(assunto, "\"", "\\\"");
+                    let pr = run_shell_full("gh pr create --title \"" + assunto_seguro + "\" --body-file " + corpo_pr);
                     print(if pr.success { "PR: " + pr.stdout } else { "FALHA no PR: " + pr.stderr });
                 }
             }
