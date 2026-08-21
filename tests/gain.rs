@@ -406,3 +406,68 @@ fn verbo_do_shell_e_so_a_primeira_palavra_sem_caminho_nem_argumento() {
     assert!(bruto.contains("\"sh\""), "{bruto}");
     assert!(!bruto.contains("segredo"), "argumento NUNCA entra: {bruto}");
 }
+
+#[test]
+fn recusa_do_strict_nao_conta_como_falha() {
+    // #95: `--strict` recusa script que colapsa menos de duas primitivas -- a
+    // defesa direta contra o desperdicio que a telemetria mede. Mas a recusa
+    // gravava exit=2, que o `gain` contava como FALHA: ligar a guarda por
+    // padrao pioraria justamente o numero que se quer baixar.
+    let home = tempfile::tempdir().unwrap();
+    let dir = dir_de_trabalho("recusa");
+    fs::write(dir.join("a.txt"), "x").unwrap();
+
+    // Uma primitiva so: a guarda recusa.
+    let s = dir.join("uma.rhai");
+    fs::write(&s, r#"print(read_file("a.txt"));"#).unwrap();
+    Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .args(["run", s.to_str().unwrap(), "--workdir"])
+        .arg(&dir)
+        .arg("--strict")
+        .assert()
+        // O exit code CONTINUA 2: quem chama o binario precisa saber que nao rodou.
+        .code(2);
+
+    let l = linhas(home.path());
+    assert_eq!(l[0]["kind"], "recusado", "{:?}", l[0]);
+    assert_eq!(l[0]["exit_code"], 2, "{:?}", l[0]);
+
+    // E nao aparece como falha no relatorio de trabalho real.
+    let out = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("gain")
+        .assert()
+        .success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(texto.contains("Recusadas pela guarda"), "aparece com nome proprio: {texto}");
+    assert!(
+        texto.contains("nenhuma execução de trabalho real"),
+        "e nao entra na conta de trabalho real: {texto}"
+    );
+}
+
+#[test]
+fn erro_de_pre_voo_continua_contando_como_falha() {
+    // A distincao que importa: recusa de GUARDA e a ferramenta decidindo que
+    // nao vale a pena rodar. Erro de sintaxe e de funcao inexistente e falha
+    // de quem escreveu o script, e tem que continuar pesando.
+    let home = tempfile::tempdir().unwrap();
+    let dir = dir_de_trabalho("erro_pre_voo");
+    let s = dir.join("ruim.rhai");
+    fs::write(&s, "read_filez(\"a.txt\"); glob(\"*\"); grep(\"x\", \".\");").unwrap();
+
+    Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .args(["run", s.to_str().unwrap(), "--workdir"])
+        .arg(&dir)
+        .assert()
+        .code(1);
+
+    let l = linhas(home.path());
+    assert_eq!(l[0]["kind"], "real", "erro do autor e trabalho real: {:?}", l[0]);
+    assert_eq!(l[0]["exit_code"], 1);
+}
