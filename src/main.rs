@@ -135,6 +135,11 @@ enum Commands {
         /// How many runs `--history` lists.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Failures in the last N runs of the segment, next to the lifetime
+        /// rate. 0 turns it off. Lifetime answers "how much was lost";
+        /// the window answers "are we getting better".
+        #[arg(long, default_value_t = gain::JANELA_PADRAO)]
+        janela: usize,
         /// Report the EXCLUDED segment instead -- benchmark cases, scratch
         /// scripts in a temp dir, and codemode developing itself. The
         /// default report covers real work only.
@@ -217,8 +222,8 @@ fn main() {
                 }
             }
         }
-        Commands::Gain { history, json, limit, bench } => {
-            match gain::run(gain::GainArgs { history, json, limit, bench }) {
+        Commands::Gain { history, json, limit, bench, janela } => {
+            match gain::run(gain::GainArgs { history, json, limit, bench, janela }) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("codemode: {e}");
