@@ -676,6 +676,7 @@ fn record_run(
         source: meta.source.clone(),
         name: meta.name.clone(),
         prims,
+        prims_shell: primitives::verbos_shell(),
         prim_total,
         out_bytes,
         exit_code,

@@ -1119,6 +1119,7 @@ fn tenta_pipeline(cmd: &str, sandbox: &Sandbox) -> Option<Result<String, Box<Eva
 
 fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String, Box<EvalAltResult>> {
     let _em_voo = marca_em_voo("run_shell", cmd);
+    conta_verbo(cmd);
     // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
     sandbox.cache.invalidar();
     if sandbox.dry {
@@ -1256,6 +1257,7 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
 /// refusal.
 fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Map, Box<EvalAltResult>> {
     let _em_voo = marca_em_voo("run_shell_full", cmd);
+    conta_verbo(cmd);
     // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
     sandbox.cache.invalidar();
     if sandbox.dry {
@@ -1784,6 +1786,36 @@ pub fn marca_em_voo(primitiva: &str, arg: &str) -> MarcaEmVoo {
 
 pub fn em_voo() -> Option<String> {
     EM_VOO.lock().ok().and_then(|v| v.clone())
+}
+
+/// Quantas vezes cada VERBO de shell foi executado -- `git`, `cargo`, `make`.
+///
+/// Só a primeira palavra, e só o basename dela. É o que responde "qual comando
+/// mais rodamos, e qual merece virar primitiva nativa?" sem carregar argumento
+/// nenhum: `git status` vira `git`, e `sh -c "curl -H Authorization: ..."` vira
+/// `sh`. Sem isto o `runs.jsonl` sabia que houve 6 `run_shell` e nada sobre o
+/// que eles rodaram -- por isso o `read_files` do #63 foi escolhido por
+/// intuição, e a medição depois mostrou que só paga acima de 400 arquivos (#82).
+///
+/// A regra de privacidade da telemetria continua valendo: metadado, nunca
+/// conteúdo. Primeira palavra é metadado; argumento não é.
+static VERBOS_SHELL: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+fn conta_verbo(cmd: &str) {
+    let Some(primeira) = cmd.split_whitespace().next() else { return };
+    // Basename: `/usr/local/bin/foo` vira `foo`. O caminho diria onde as
+    // coisas estão instaladas, que é mais do que a pergunta precisa.
+    let verbo = primeira.rsplit('/').next().unwrap_or(primeira);
+    if verbo.is_empty() {
+        return;
+    }
+    if let Ok(mut m) = VERBOS_SHELL.lock() {
+        *m.entry(verbo.to_string()).or_insert(0) += 1;
+    }
+}
+
+pub fn verbos_shell() -> std::collections::BTreeMap<String, u64> {
+    VERBOS_SHELL.lock().map(|m| m.clone()).unwrap_or_default()
 }
 
 pub fn total_chamadas() -> u64 {
