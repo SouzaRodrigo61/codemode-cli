@@ -471,3 +471,85 @@ fn erro_de_pre_voo_continua_contando_como_falha() {
     assert_eq!(l[0]["kind"], "real", "erro do autor e trabalho real: {:?}", l[0]);
     assert_eq!(l[0]["exit_code"], 1);
 }
+
+/// Linha sintetica de trabalho real, com timestamp e exit code controlados --
+/// e o unico jeito de montar um historico onde a taxa vitalicia e a da janela
+/// divergem de proposito.
+fn linha_sintetica(ts: u64, exit_code: i32) -> String {
+    format!(
+        "{{\"ts\":{ts},\"script\":\"h\",\"source\":\"file\",\"prims\":{{\"run_shell\":3}},\
+\"prim_total\":3,\"out_bytes\":10,\"exit_code\":{exit_code},\"ms\":1,\
+\"workdir\":\"/\",\"kind\":\"real\"}}"
+    )
+}
+
+#[test]
+fn gain_mostra_vitalicia_e_janela_movel_quando_divergem() {
+    // #96: a taxa vitalicia trava a meta. Com 5 falhas historicas em 33
+    // execucoes reais, so cai abaixo de 5% depois de 68 execucoes limpas --
+    // a meta deixa de ser meta e vira espera. E reportar so a vitalicia
+    // esconde o efeito de qualquer correcao recente.
+    let home = tempfile::tempdir().unwrap();
+    // 10 falhas antigas, depois 20 execucoes limpas: vitalicia 33%, janela 0%.
+    let mut linhas: Vec<String> = (0..10).map(|i| linha_sintetica(1000 + i, 1)).collect();
+    linhas.extend((0..20).map(|i| linha_sintetica(2000 + i, 0)));
+    fs::write(home.path().join("runs.jsonl"), linhas.join("\n") + "\n").unwrap();
+
+    let out = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("gain")
+        .assert()
+        .success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(texto.contains("(33.3%)  vitalícia"), "{texto}");
+    assert!(texto.contains("nas últimas 20"), "{texto}");
+    assert!(texto.contains("(0.0%)  janela"), "a janela mostra a melhora: {texto}");
+}
+
+#[test]
+fn janela_nao_repete_o_total_quando_nao_ha_execucoes_suficientes() {
+    // Com 5 execucoes e janela de 20, os dois numeros seriam identicos --
+    // repetir o mesmo valor com dois rotulos so faz o leitor procurar
+    // diferenca onde nao ha.
+    let home = tempfile::tempdir().unwrap();
+    let linhas: Vec<String> = (0..5).map(|i| linha_sintetica(1000 + i, 0)).collect();
+    fs::write(home.path().join("runs.jsonl"), linhas.join("\n") + "\n").unwrap();
+
+    let out = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("gain")
+        .assert()
+        .success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(texto.contains("vitalícia"), "{texto}");
+    assert!(!texto.contains("janela móvel"), "sem janela quando nao ha o que comparar: {texto}");
+}
+
+#[test]
+fn janela_zero_desliga_e_o_json_traz_o_numero() {
+    let home = tempfile::tempdir().unwrap();
+    let mut linhas: Vec<String> = (0..10).map(|i| linha_sintetica(1000 + i, 1)).collect();
+    linhas.extend((0..20).map(|i| linha_sintetica(2000 + i, 0)));
+    fs::write(home.path().join("runs.jsonl"), linhas.join("\n") + "\n").unwrap();
+
+    let desligada = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .args(["gain", "--janela", "0"])
+        .assert()
+        .success();
+    let texto = String::from_utf8(desligada.get_output().stdout.clone()).unwrap();
+    assert!(!texto.contains("janela móvel"), "{texto}");
+
+    let json = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .args(["gain", "--json"])
+        .assert()
+        .success();
+    let j: serde_json::Value = serde_json::from_slice(&json.get_output().stdout).unwrap();
+    assert_eq!(j["falhas_janela"]["falhas"], 0, "{j}");
+    assert_eq!(j["falhas_janela"]["de"], 20, "{j}");
+}
