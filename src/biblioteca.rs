@@ -273,6 +273,10 @@ MULTI-REPO -- raiz com nome e `cwd:`
   glob("@ui/src/**/*.ts")
   run_shell(cmd, #{{cwd: "@ui"}})      o comando roda LÁ, sem cd
   run_shell_full(cmd, #{{cwd: "@ui"}})
+  parallel_shell([#{{cmd: "git log -1", cwd: "@ui"}},
+                  #{{cmd: "git log -1", cwd: "@backend"}}])
+                                     o mesmo comando em N repos, de uma vez:
+                                     medido 150ms -> 63ms em 12 comandos
 
   `cd` NÃO persiste: cada run_shell é um processo novo, e um `cd` que erra
   derruba o script inteiro. Foi o 2o verbo mais presente em execução que

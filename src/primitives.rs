@@ -2178,7 +2178,37 @@ fn corta(s: &str, n: usize) -> String {
 /// atual, então a forma é uma lista de comandos, não um `parallel(itens,
 /// |x| ...)` genérico.
 fn parallel_shell_impl(sandbox: &Sandbox, cmds: Array) -> Result<Array, Box<EvalAltResult>> {
-    let lista: Vec<String> = cmds.iter().map(|c| c.to_string()).collect();
+    // Cada item é uma string (roda na raiz primária, como sempre) OU um mapa
+    // `#{cmd, cwd}`. O mapa existe pro caso que domina o trabalho aqui: o
+    // mesmo comando em N repositórios. Sem cwd por item, um fan-out
+    // multi-repo tinha que virar N chamadas seriais -- e 53% do tempo de
+    // execução medido está justamente em cadeias de 3+ shells em série.
+    let mut lista: Vec<String> = Vec::with_capacity(cmds.len());
+    let mut dirs: Vec<Option<PathBuf>> = Vec::with_capacity(cmds.len());
+    for item in cmds.iter() {
+        if let Some(m) = item.read_lock::<Map>() {
+            let cmd = m
+                .get("cmd")
+                .ok_or_else(|| to_err("parallel_shell: item em mapa precisa de `cmd`".to_string()))?
+                .clone()
+                .into_string()
+                .map_err(|_| to_err("parallel_shell: `cmd` precisa ser string".to_string()))?;
+            let dir = match m.get("cwd") {
+                None => None,
+                Some(v) => {
+                    let s = v.clone().into_string().map_err(|_| {
+                        to_err("parallel_shell: `cwd` precisa ser string".to_string())
+                    })?;
+                    Some(sandbox.dir_confinado(&s).map_err(to_err)?)
+                }
+            };
+            lista.push(cmd);
+            dirs.push(dir);
+        } else {
+            lista.push(item.to_string());
+            dirs.push(None);
+        }
+    }
 
     // Denylist antes de despachar: uma recusa não pode ficar escondida
     // dentro de uma thread e virar erro capturável.
@@ -2196,12 +2226,18 @@ fn parallel_shell_impl(sandbox: &Sandbox, cmds: Array) -> Result<Array, Box<Eval
     let mut saida = Array::new();
     EM_PARALELO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _guarda = GuardaParalelo;
-    for bloco in lista.chunks(limite) {
+    let pares: Vec<(&String, &Option<PathBuf>)> = lista.iter().zip(dirs.iter()).collect();
+    for bloco in pares.chunks(limite) {
         let mut parciais: Vec<Result<Map, String>> = Vec::with_capacity(bloco.len());
         std::thread::scope(|escopo| {
             let handles: Vec<_> = bloco
                 .iter()
-                .map(|cmd| escopo.spawn(move || run_shell_full_impl(sandbox, cmd, false, None).map_err(|e| e.to_string())))
+                .map(|(cmd, dir)| {
+                    escopo.spawn(move || {
+                        run_shell_full_impl(sandbox, cmd, false, dir.as_deref())
+                            .map_err(|e| e.to_string())
+                    })
+                })
                 .collect();
             for h in handles {
                 parciais.push(h.join().unwrap_or_else(|_| Err("thread do parallel_shell morreu".into())));
@@ -2434,7 +2470,12 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>,
     let sb = sandbox.clone();
     let ct = counter.clone();
     engine.register_fn("parallel_shell", move |cmds: Array| -> Result<Array, Box<EvalAltResult>> {
-        bump(&ct, "parallel_shell");
+        // Conta UMA por comando, não uma pela chamada. Um fan-out de 12
+        // comandos evitou 12 tool-calls; contar 1 fazia `calls_avoided`
+        // dizer ZERO e ainda jogava a execução no bucket de "1 primitiva =
+        // desperdício" -- ou seja, a métrica punia exatamente a forma mais
+        // rápida de fazer o trabalho.
+        bump_n(&ct, "parallel_shell", cmds.len().max(1) as u64);
         parallel_shell_impl(&sb, cmds)
     });
 

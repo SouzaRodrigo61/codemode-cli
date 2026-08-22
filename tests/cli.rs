@@ -1498,3 +1498,37 @@ fn exec_usa_atalho_nativo_mas_falha_cai_pro_shell_de_verdade() {
         .assert()
         .code(1);
 }
+
+#[test]
+fn parallel_shell_aceita_cwd_por_item_e_conta_por_comando() {
+    // O fan-out multi-repo: o mesmo comando em N repositórios, de uma vez.
+    // E a métrica tem que contar N, não 1 -- contar 1 fazia `calls_avoided`
+    // dizer zero e jogava a execução no bucket de desperdício, punindo
+    // exatamente a forma mais rápida de fazer o trabalho.
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    fs::write(a.path().join("quem.txt"), "repo-a").unwrap();
+    fs::write(b.path().join("quem.txt"), "repo-b").unwrap();
+    let script = a.path().join("s.rhai");
+    fs::write(
+        &script,
+        r#"let r = parallel_shell([#{cmd: "cat quem.txt"}, #{cmd: "cat quem.txt", cwd: "@outro"}]);
+           print(r[0].stdout + "|" + r[1].stdout);"#,
+    )
+    .unwrap();
+
+    let out = cmd()
+        .args(["run"])
+        .arg(&script)
+        .arg("--workdir")
+        .arg(a.path())
+        .arg("--root")
+        .arg(format!("outro={}", b.path().display()))
+        .arg("--json")
+        .output()
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(j["output"].as_str().unwrap().contains("repo-a|repo-b"), "{j}");
+    assert_eq!(j["prim_total"], 2, "conta um por comando: {j}");
+    assert_eq!(j["calls_avoided"], 1, "{j}");
+}
