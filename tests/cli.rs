@@ -1474,3 +1474,27 @@ fn max_context_corta_a_saida_e_aponta_o_spill() {
         .stderr(predicates::str::contains("cortada").and(predicates::str::contains("--max-context")));
 }
 
+
+#[test]
+fn exec_usa_atalho_nativo_mas_falha_cai_pro_shell_de_verdade() {
+    // O atalho em processo tira o spawn do caminho feliz. Na falha ele NÃO
+    // pode responder: o erro dele é redigido pro caminho de script ("use
+    // run_shell_full()"), e `exec` é o shell do host -- quem chama espera a
+    // mensagem do comando e o código dele.
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "cat", "nao-existe.txt"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("run_shell_full").not());
+
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "false"])
+        .assert()
+        .code(1);
+}

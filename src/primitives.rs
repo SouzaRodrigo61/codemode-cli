@@ -1361,6 +1361,35 @@ pub fn exec_one(sandbox: &Sandbox, argv: &[String], confirm: bool) -> Result<(St
     let uma_linha = argv.len() == 1;
     let precisa_shell = uma_linha && SHELL_METACHARS.iter().any(|c| argv[0].contains(*c));
 
+    // Os mesmos atalhos em processo que o caminho de script já tinha, e que
+    // `exec` estava deixando na mesa. Aqui eles valem MAIS: no script o
+    // atalho poupa um spawn; aqui poupa o único spawn que restava, e o
+    // `codemode` deixa de ser mais caro que o shell pros comandos cobertos.
+    // `run_shell` roteado paga codemode -> rtk -> alvo (três processos); o
+    // filtro em processo derruba isso para um.
+    let atalho: Option<Result<String, Box<EvalAltResult>>> = if precisa_shell {
+        None
+    } else {
+        let palavras: Vec<String> = if uma_linha {
+            shell_words::split(&argv[0]).ok().unwrap_or_default()
+        } else {
+            argv.to_vec()
+        };
+        if palavras.is_empty() {
+            None
+        } else {
+            try_comando_nativo(&palavras, sandbox)
+                .or_else(|| try_in_process_filter(&palavras, sandbox))
+        }
+    };
+    // Só o sucesso volta pelo atalho. Na falha ele cai pro spawn de verdade:
+    // o erro do atalho é redigido pro caminho de script ("use run_shell_full()"),
+    // e `exec` é o shell do host -- quem chama espera a saída do comando, não
+    // prosa do codemode. Custa um spawn, e só quando o comando já falhou.
+    if let Some(Ok(s)) = atalho {
+        return Ok((s, 0));
+    }
+
     let sh_fallback = |linha: &str| {
         let mut c = Command::new("sh");
         c.arg("-c").arg(linha).current_dir(&sandbox.root);
