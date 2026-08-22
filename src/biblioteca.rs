@@ -269,8 +269,8 @@ MULTI-REPO -- raiz com nome e `cwd:`
   --root ui=/caminho/thurion-ui      declara a raiz (repetível)
   read_file("@ui/package.json")      `@nome` vale em qualquer primitiva de caminho
   glob("@ui/src/**/*.ts")
-  run_shell(cmd, #{cwd: "@ui"})      o comando roda LÁ, sem cd
-  run_shell_full(cmd, #{cwd: "@ui"})
+  run_shell(cmd, #{{cwd: "@ui"}})      o comando roda LÁ, sem cd
+  run_shell_full(cmd, #{{cwd: "@ui"}})
 
   `cd` NÃO persiste: cada run_shell é um processo novo, e um `cd` que erra
   derruba o script inteiro. Foi o 2o verbo mais presente em execução que
