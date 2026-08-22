@@ -2,6 +2,7 @@
 //! point of code mode. A script calls these in sequence inside one
 //! process instead of the caller issuing N separate tool-calls.
 
+use std::path::{Path, PathBuf};
 use crate::denylist;
 use crate::sandbox::Sandbox;
 use rhai::{Array, Engine, EvalAltResult, Map};
@@ -1117,7 +1118,7 @@ fn tenta_pipeline(cmd: &str, sandbox: &Sandbox) -> Option<Result<String, Box<Eva
     Some(Ok(atual))
 }
 
-fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String, Box<EvalAltResult>> {
+fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool, cwd: Option<&Path>) -> Result<String, Box<EvalAltResult>> {
     let _em_voo = marca_em_voo("run_shell", cmd);
     conta_verbo(cmd);
     // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
@@ -1171,8 +1172,10 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
     // and anything the direct spawn can't find.
     // Pipeline simples e redirecionamento resolvidos sem o `sh` no meio
     // (#30). Qualquer coisa fora do subconjunto seguro devolve None aqui e
-    // segue o caminho de sempre.
-    if !sandbox.dry {
+    // segue o caminho de sempre. Com `cwd:` os atalhos ficam de fora: todos
+    // assumem a raiz primária, e um deles rodando no diretório errado seria
+    // pior que perder o atalho.
+    if !sandbox.dry && cwd.is_none() {
         if let Some(resultado) = tenta_pipeline(cmd, sandbox) {
             return resultado;
         }
@@ -1192,14 +1195,14 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
     // Antes de qualquer spawn: o comando trivial resolvido aqui dentro custa
     // 0,02ms contra 1,5-8,5ms de processo (#29). So a forma exata entra.
     if let Some(words) = &plain {
-        if !sandbox.dry {
+        if !sandbox.dry && cwd.is_none() {
             if let Some(resultado) = try_comando_nativo(words, sandbox) {
                 return resultado;
             }
         }
     }
 
-    if routed {
+    if routed && cwd.is_none() {
         if let Some(words) = &plain {
             if let Some(result) = try_in_process_filter(words, sandbox) {
                 return result;
@@ -1208,15 +1211,16 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
     }
 
     let t = sandbox.cmd_timeout;
+    let base: &Path = cwd.unwrap_or(&sandbox.root);
     let sh_fallback = || {
         let mut c = Command::new("sh");
-        c.arg("-c").arg(cmd).current_dir(&sandbox.root);
+        c.arg("-c").arg(cmd).current_dir(base);
         exec_com_deadline(c, t, cmd)
     };
     let output = match &plain {
         Some(words) if routed => {
             let mut c = Command::new("rtk");
-            c.args(words).current_dir(&sandbox.root);
+            c.args(words).current_dir(base);
             match exec_com_deadline(c, t, cmd) {
             Ok(o) => Ok(o),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => sh_fallback(),
@@ -1224,7 +1228,7 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
         }}
         Some(words) => {
             let mut c = Command::new(&words[0]);
-            c.args(&words[1..]).current_dir(&sandbox.root);
+            c.args(&words[1..]).current_dir(base);
             match exec_com_deadline(c, t, cmd) {
             Ok(o) => Ok(o),
             // NotFound covers shell builtins/functions (`command`, `type`,
@@ -1255,7 +1259,7 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
 /// print/return -> `run_shell` (filtered); output you branch on ->
 /// `run_shell_full` (raw, typed). Same denylist gate, same uncatchable
 /// refusal.
-fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Map, Box<EvalAltResult>> {
+fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool, cwd: Option<&Path>) -> Result<Map, Box<EvalAltResult>> {
     let _em_voo = marca_em_voo("run_shell_full", cmd);
     conta_verbo(cmd);
     // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
@@ -1288,15 +1292,16 @@ fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Ma
         shell_words::split(cmd).ok().filter(|w| !w.is_empty())
     };
     let t = sandbox.cmd_timeout;
+    let base: &Path = cwd.unwrap_or(&sandbox.root);
     let sh_fallback = || {
         let mut c = Command::new("sh");
-        c.arg("-c").arg(cmd).current_dir(&sandbox.root);
+        c.arg("-c").arg(cmd).current_dir(base);
         exec_com_deadline(c, t, cmd)
     };
     let output = match &plain {
         Some(words) => {
             let mut c = Command::new(&words[0]);
-            c.args(&words[1..]).current_dir(&sandbox.root);
+            c.args(&words[1..]).current_dir(base);
             match exec_com_deadline(c, t, cmd) {
                 Ok(o) => Ok(o),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => sh_fallback(),
@@ -1529,6 +1534,19 @@ fn http_get_impl(allow: &[String], url: &str) -> Result<Map, Box<EvalAltResult>>
     map.insert("body".into(), body.into());
     map.insert("success".into(), (200..300).contains(&status).into());
     Ok(map)
+}
+
+/// `cwd:` das opções de run_shell/run_shell_full. Resolvido pelo sandbox,
+/// então `@repo2/crates/x` e caminho absoluto dentro de uma raiz valem, e
+/// qualquer coisa fora das raízes é recusada como qualquer outro caminho.
+fn cwd_from_map(sandbox: &Sandbox, opts: &Map) -> Result<Option<PathBuf>, Box<EvalAltResult>> {
+    match opts.get("cwd") {
+        None => Ok(None),
+        Some(v) => {
+            let s = v.clone().into_string().map_err(|_| to_err("cwd: precisa ser string".to_string()))?;
+            Ok(Some(sandbox.dir_confinado(&s).map_err(to_err)?))
+        }
+    }
 }
 
 fn confirm_from_map(opts: &Map) -> bool {
@@ -2148,7 +2166,7 @@ fn parallel_shell_impl(sandbox: &Sandbox, cmds: Array) -> Result<Array, Box<Eval
         std::thread::scope(|escopo| {
             let handles: Vec<_> = bloco
                 .iter()
-                .map(|cmd| escopo.spawn(move || run_shell_full_impl(sandbox, cmd, false).map_err(|e| e.to_string())))
+                .map(|cmd| escopo.spawn(move || run_shell_full_impl(sandbox, cmd, false, None).map_err(|e| e.to_string())))
                 .collect();
             for h in handles {
                 parciais.push(h.join().unwrap_or_else(|_| Err("thread do parallel_shell morreu".into())));
@@ -2323,35 +2341,37 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>,
     let ct = counter.clone();
     engine.register_fn("run_shell", move |cmd: &str| -> Result<String, Box<EvalAltResult>> {
         bump(&ct, "run_shell");
-        run_shell_impl(&sb, cmd, false)
+        run_shell_impl(&sb, cmd, false, None)
     });
 
     let sb = sandbox.clone();
     let ct = counter.clone();
     engine.register_fn("run_shell", move |cmd: &str, opts: Map| -> Result<String, Box<EvalAltResult>> {
         bump(&ct, "run_shell");
-        run_shell_impl(&sb, cmd, confirm_from_map(&opts))
+        let cwd = cwd_from_map(&sb, &opts)?;
+        run_shell_impl(&sb, cmd, confirm_from_map(&opts), cwd.as_deref())
     });
 
     let sb = sandbox.clone();
     let ct = counter.clone();
     engine.register_fn("run_shell_full", move |cmd: &str| -> Result<Map, Box<EvalAltResult>> {
         bump(&ct, "run_shell_full");
-        run_shell_full_impl(&sb, cmd, false)
+        run_shell_full_impl(&sb, cmd, false, None)
     });
 
     let sb = sandbox.clone();
     let ct = counter.clone();
     engine.register_fn("run_shell_full", move |cmd: &str, opts: Map| -> Result<Map, Box<EvalAltResult>> {
         bump(&ct, "run_shell_full");
-        run_shell_full_impl(&sb, cmd, confirm_from_map(&opts))
+        let cwd = cwd_from_map(&sb, &opts)?;
+        run_shell_full_impl(&sb, cmd, confirm_from_map(&opts), cwd.as_deref())
     });
 
     let sb = sandbox.clone();
     let ct = counter.clone();
     engine.register_fn("run_shell_confirmed", move |cmd: &str| -> Result<String, Box<EvalAltResult>> {
         bump(&ct, "run_shell_confirmed");
-        run_shell_impl(&sb, cmd, true)
+        run_shell_impl(&sb, cmd, true, None)
     });
 
     let sb = sandbox.clone();

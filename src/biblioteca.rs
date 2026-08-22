@@ -265,6 +265,21 @@ BIBLIOTECA -- os dois diretórios chamados .codemode
   codemode check <script>        pré-voo sem executar
   codemode run x.rhai --dry-run  anuncia toda escrita/comando, não faz nenhum
 
+MULTI-REPO -- raiz com nome e `cwd:`
+  --root ui=/caminho/thurion-ui      declara a raiz (repetível)
+  read_file("@ui/package.json")      `@nome` vale em qualquer primitiva de caminho
+  glob("@ui/src/**/*.ts")
+  run_shell(cmd, #{cwd: "@ui"})      o comando roda LÁ, sem cd
+  run_shell_full(cmd, #{cwd: "@ui"})
+
+  `cd` NÃO persiste: cada run_shell é um processo novo, e um `cd` que erra
+  derruba o script inteiro. Foi o 2o verbo mais presente em execução que
+  falhou. A resposta é `cwd:`, nunca `cd x && ...`.
+
+  Nome em vez de caminho absoluto é o que torna um script multi-repo
+  versionável em `.codemode/`: com caminho cru ele só roda na máquina de
+  quem escreveu.
+
 UM COMANDO SÓ -- `codemode exec`
   codemode exec -- <cmd>         um comando pelo mesmo cinto de seguranca:
                                  denylist, --cmd-timeout, roteamento pro RTK

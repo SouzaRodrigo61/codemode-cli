@@ -50,6 +50,13 @@ enum Commands {
         /// Each root is confined on its own; there is no path between them.
         #[arg(long = "extra-root")]
         extra_root: Vec<PathBuf>,
+        /// Raiz com nome, `nome=/caminho` (repetível). Dentro do script,
+        /// `@nome` e `@nome/sub` viram esse caminho -- inclusive em
+        /// `run_shell(cmd, #{cwd: "@nome"})`. É o que torna um script
+        /// multi-repo versionável: sem nome ele carregaria caminho absoluto
+        /// e só rodaria na máquina de quem escreveu.
+        #[arg(long = "root", value_parser = parse_root)]
+        root: Vec<(String, PathBuf)>,
         /// Max bytes of consolidated output before truncation. This is the
         /// runaway-script guard, not a context budget -- see --max-context.
         #[arg(long = "max-output", default_value_t = 1_048_576)]
@@ -237,8 +244,9 @@ fn main() {
             dry_run,
             allow_host,
             script_args,
+            root,
         } => {
-            let opts = RunOpts { timeout, cmd_timeout, vm_idle, extra_root, max_output, max_context, verbose, strict, json, dry_run, allow_hosts: allow_host };
+            let opts = RunOpts { timeout, cmd_timeout, vm_idle, extra_root, named_roots: root, max_output, max_context, verbose, strict, json, dry_run, allow_hosts: allow_host };
             match run(&script, &workdir, opts, script_args) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
@@ -351,11 +359,20 @@ fn read_script(script: &str, workdir: &Path) -> Result<(String, &'static str), S
 
 /// Opções de uma execução. Viraram struct quando `run` passou de 8
 /// parâmetros -- e porque #18 acrescentou três de uma vez.
+/// `--root nome=/caminho`. Separa no PRIMEIRO `=`: caminho pode conter `=`.
+fn parse_root(s: &str) -> Result<(String, PathBuf), String> {
+    match s.split_once('=') {
+        Some((n, p)) if !n.is_empty() && !p.is_empty() => Ok((n.to_string(), PathBuf::from(p))),
+        _ => Err(format!("--root espera nome=/caminho, recebeu {s:?}")),
+    }
+}
+
 struct RunOpts {
     timeout: u64,
     cmd_timeout: u64,
     vm_idle: u64,
     extra_root: Vec<PathBuf>,
+    named_roots: Vec<(String, PathBuf)>,
     max_output: usize,
     max_context: usize,
     verbose: bool,
@@ -366,7 +383,7 @@ struct RunOpts {
 }
 
 fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>) -> Result<i32, String> {
-    let RunOpts { timeout: timeout_secs, cmd_timeout, vm_idle, extra_root, max_output, max_context, verbose, strict, json, dry_run, allow_hosts } = opts;
+    let RunOpts { timeout: timeout_secs, cmd_timeout, vm_idle, extra_root, named_roots, max_output, max_context, verbose, strict, json, dry_run, allow_hosts } = opts;
     let started = Instant::now();
     let (source, origem) = read_script(script_arg, workdir)?;
     let counter = primitives::new_counter();
@@ -394,7 +411,8 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
     let sandbox = Sandbox::new(workdir)?
         .with_dry(dry_run)
         .with_cmd_timeout(cmd_timeout)
-        .with_extra_roots(&extra_root)?;
+        .with_extra_roots(&extra_root)?
+        .with_named_roots(&named_roots)?;
 
     let mut engine = primitives::nova_engine();
     primitives::register(&mut engine, sandbox, allow_hosts, counter.clone());

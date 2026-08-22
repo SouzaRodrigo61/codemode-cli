@@ -1349,3 +1349,76 @@ fn exec_avisa_quando_passa_de_max_context() {
         .success()
         .stderr(predicates::str::contains("max-context"));
 }
+
+// ---- multi-repo: raízes nomeadas e cwd por comando ----
+
+#[test]
+fn cwd_roda_o_comando_na_raiz_nomeada() {
+    // O caso real que motivou tudo: comparar repo 1 com repo 2 sem `cd`.
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    fs::write(a.path().join("quem.txt"), "repo-a").unwrap();
+    fs::write(b.path().join("quem.txt"), "repo-b").unwrap();
+    let script = a.path().join("s.rhai");
+    fs::write(
+        &script,
+        r#"print(trimmed(run_shell("cat quem.txt", #{cwd: "@outro"})));"#,
+    )
+    .unwrap();
+
+    cmd()
+        .args(["run"])
+        .arg(&script)
+        .arg("--workdir")
+        .arg(a.path())
+        .arg("--root")
+        .arg(format!("outro={}", b.path().display()))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("repo-b"));
+}
+
+#[test]
+fn raiz_nomeada_desconhecida_falha_dizendo_o_conserto() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"read_file("@fantasma/x.txt");"#).unwrap();
+
+    cmd()
+        .args(["run"])
+        .arg(&script)
+        .arg("--workdir")
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--root fantasma="));
+}
+
+#[test]
+fn cwd_fora_das_raizes_e_recusado() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"run_shell("ls", #{cwd: "/etc"});"#).unwrap();
+
+    cmd()
+        .args(["run"])
+        .arg(&script)
+        .arg("--workdir")
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("outside sandbox"));
+}
+
+#[test]
+fn check_avisa_que_cd_nao_persiste() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"run_shell("cd crates"); run_shell("ls");"#).unwrap();
+
+    cmd()
+        .args(["check"])
+        .arg(&script)
+        .assert()
+        .stderr(predicates::str::contains("cwd"));
+}
