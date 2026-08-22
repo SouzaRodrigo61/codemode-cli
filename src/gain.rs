@@ -113,6 +113,10 @@ pub fn run(args: GainArgs) -> Result<i32, String> {
     // foi o que inflou o ganho ~145x e escondeu 33% de falha (#59).
     let (reais, resto): (Vec<Entry>, Vec<Entry>) =
         entries.iter().cloned().partition(|e| e.is_real());
+    // `exec` é UM comando de propósito -- é o caminho de shell do host, não
+    // um script que colapsou pouco. Contá-lo no bucket de desperdício faria
+    // o relatório acusar de erro justamente o uso que queremos universal.
+    let reais: Vec<_> = reais.into_iter().filter(|e| e.source != "exec").collect();
     // Linha antiga cujo workdir sumiu não é contada como real nem como bench --
     // aparece com nome próprio, para a incerteza ficar visível em vez de virar
     // número.

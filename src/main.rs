@@ -87,6 +87,31 @@ enum Commands {
         #[arg(long = "arg")]
         script_args: Vec<String>,
     },
+    /// Run ONE shell command through codemode: same denylist, same
+    /// `--cmd-timeout`, same RTK routing the script primitives get, plus
+    /// telemetry. This is the path a host's shell tool should call so that
+    /// "every shell command goes through codemode" costs 7ms instead of a
+    /// Rhai VM. Exits with the command's own exit code.
+    Exec {
+        /// The command and its arguments, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+        /// Directory the command runs in.
+        #[arg(long, default_value = ".")]
+        workdir: PathBuf,
+        /// Seconds the command may run before being killed. 0 disables.
+        #[arg(long = "cmd-timeout", default_value_t = 600)]
+        cmd_timeout: u64,
+        /// Max bytes of output before truncation -- the runaway guard.
+        #[arg(long = "max-output", default_value_t = 1_048_576)]
+        max_output: usize,
+        /// Warn (never truncate) past this many bytes: output costs token.
+        #[arg(long = "max-context", default_value_t = 65_536)]
+        max_context: usize,
+        /// Run even if the command matches a denylist rule.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Copy the last script you ran (or --from) into `<workdir>/.codemode/`
     /// so it stops being scratchpad litter and starts being a repo asset.
     Save {
@@ -221,6 +246,53 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Commands::Exec { cmd, workdir, cmd_timeout, max_output, max_context, confirm } => {
+            let started = Instant::now();
+            
+            let sandbox = match Sandbox::new(&workdir).map(|s| s.with_cmd_timeout(cmd_timeout)) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("codemode: {e}"); std::process::exit(1); }
+            };
+            let (mut saida, codigo) = match primitives::exec_one(&sandbox, &cmd, confirm) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("codemode: {e}"); std::process::exit(2); }
+            };
+            if saida.len() > max_output {
+                saida.truncate(max_output);
+                saida.push_str("\n[... saída truncada em --max-output]");
+            }
+            if saida.len() > max_context {
+                eprintln!(
+                    "codemode: saída de {}B passou de --max-context ({}B) -- isso é relido em toda chamada seguinte da sessão",
+                    saida.len(), max_context
+                );
+            }
+            print!("{saida}");
+            let verbo = cmd.first().cloned().unwrap_or_default();
+            let workdir_abs = std::fs::canonicalize(&workdir)
+                .unwrap_or_else(|_| workdir.clone()).display().to_string();
+            let mut prims = std::collections::BTreeMap::new();
+            prims.insert("exec".to_string(), 1u64);
+            let mut verbos = std::collections::BTreeMap::new();
+            verbos.insert(verbo.clone(), 1u64);
+            telemetry::record(&telemetry::Entry {
+                ts: telemetry::now_secs(),
+                // Só o verbo: a linha inteira carrega argumento, e telemetria
+                // aqui é metadado, nunca conteúdo.
+                script: telemetry::hash(&verbo),
+                source: "exec".into(),
+                name: Some(verbo),
+                prims,
+                prims_shell: verbos,
+                prim_total: 1,
+                out_bytes: saida.len() as u64,
+                exit_code: codigo,
+                ms: started.elapsed().as_millis() as u64,
+                kind: Some(telemetry::classify(&workdir_abs, None)),
+                workdir: workdir_abs,
+            });
+            std::process::exit(codigo);
         }
         Commands::Gain { history, json, limit, bench, janela } => {
             match gain::run(gain::GainArgs { history, json, limit, bench, janela }) {

@@ -265,6 +265,14 @@ BIBLIOTECA -- os dois diretórios chamados .codemode
   codemode check <script>        pré-voo sem executar
   codemode run x.rhai --dry-run  anuncia toda escrita/comando, não faz nenhum
 
+UM COMANDO SÓ -- `codemode exec`
+  codemode exec -- <cmd>         um comando pelo mesmo cinto de seguranca:
+                                 denylist, --cmd-timeout, roteamento pro RTK
+                                 e telemetria, saindo com o exit code dele.
+  É o caminho pro shell do host: 7ms de overhead contra `sh -c`, contra a
+  VM inteira que um script Rhai de uma linha paga. `run` continua sendo pra
+  2+ operacoes; `exec` e pra 1.
+
 QUANDO NÃO USAR
   Uma operação só (1 read, 1 edit, 1 comando) é mais barata em Bash direto.
   O ganho aparece a partir de 2, e é real a partir de 3.

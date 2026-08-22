@@ -1318,6 +1318,94 @@ fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Ma
     Ok(map)
 }
 
+// ---- exec: um comando de shell, o caminho do host ----
+
+/// Um comando de shell pelo mesmo cinto de segurança que as primitivas de
+/// script usam: denylist, `--cmd-timeout`, o mesmo caminho de spawn e o
+/// mesmo roteamento pro RTK. Devolve `(saída combinada, exit code)` em vez
+/// de lançar, porque `exec` É o caminho de shell do host -- quem chama
+/// ramifica no código de saída, e perdê-lo quebraria todo `if` do agente.
+///
+/// Existe pra que "todo comando de shell passa pelo codemode" seja verdade
+/// sem custar mais que o Bash cru: medido em 7 ms de overhead contra
+/// `sh -c`, contra o script Rhai de uma linha que ainda paga a VM.
+pub fn exec_one(sandbox: &Sandbox, argv: &[String], confirm: bool) -> Result<(String, i32), String> {
+    // A linha só existe para a denylist e para o log. NUNCA para re-split:
+    // juntar argv e separar de novo destrói as aspas do chamador, e
+    // `exec -- sh -c "exit 7"` virava `sh -c exit 7`, que sai 0. O host
+    // teria perdido silenciosamente todo código de saída.
+    let linha = argv.join(" ");
+    if !confirm {
+        if let Some(rule) = denylist::check(&linha) {
+            return Err(format!(
+                "exec recusado: o comando casa com a regra '{rule}' da denylist. Passe --confirm se for mesmo o que você quer."
+            ));
+        }
+    }
+    conta_verbo(&linha);
+    let t = sandbox.cmd_timeout;
+
+    // Um argumento só é uma LINHA de shell (pode ter pipe, redirect, `&&`);
+    // dois ou mais já são argv e vão direto, sem shell no meio.
+    let uma_linha = argv.len() == 1;
+    let precisa_shell = uma_linha && SHELL_METACHARS.iter().any(|c| argv[0].contains(*c));
+
+    let sh_fallback = |linha: &str| {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(linha).current_dir(&sandbox.root);
+        exec_com_deadline(c, t, linha)
+    };
+    if precisa_shell {
+        let output = sh_fallback(&argv[0]).map_err(|e| format!("exec: {e}"))?;
+        return Ok(colhe(output));
+    }
+
+    let palavras: Vec<String> = if uma_linha {
+        shell_words::split(&argv[0]).map_err(|e| format!("exec: {e}"))?
+    } else {
+        argv.to_vec()
+    };
+    if palavras.is_empty() {
+        return Err("exec: comando vazio".into());
+    }
+    // Mesma tabela que o `run_shell` usa: `exec` e o caminho de script
+    // precisam concordar sobre o que vale filtrar, senão o mesmo comando
+    // devolve tamanhos diferentes dependendo de quem chamou.
+    let routed = RTK_WORTH_ROUTING.contains(&palavras[0].as_str())
+        && !grep_shape_rtk_would_passthrough(&palavras)
+        && !saida_ja_e_minima(&palavras);
+    let direto = || {
+        let mut c = Command::new(&palavras[0]);
+        c.args(&palavras[1..]).current_dir(&sandbox.root);
+        exec_com_deadline(c, t, &linha)
+    };
+    let output = if routed {
+        let mut c = Command::new("rtk");
+        c.args(&palavras).current_dir(&sandbox.root);
+        match exec_com_deadline(c, t, &linha) {
+            Ok(o) => Ok(o),
+            // rtk ausente não pode derrubar o shell do host.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => direto(),
+            Err(e) => Err(e),
+        }
+    } else {
+        match direto() {
+            Ok(o) => Ok(o),
+            // builtins e funções de shell só existem dentro de um shell.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => sh_fallback(&linha),
+            Err(e) => Err(e),
+        }
+    }
+    .map_err(|e| format!("exec: {e}"))?;
+    Ok(colhe(output))
+}
+
+fn colhe(output: std::process::Output) -> (String, i32) {
+    let mut saida = String::from_utf8_lossy(&output.stdout).into_owned();
+    saida.push_str(&String::from_utf8_lossy(&output.stderr));
+    (saida, output.status.code().unwrap_or(-1))
+}
+
 // ---- http_get ----
 
 /// Splits an http(s) URL into (host, explicit port, is_https). Deliberately

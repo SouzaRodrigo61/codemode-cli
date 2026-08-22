@@ -1273,3 +1273,79 @@ fn erro_de_run_shell_carrega_a_saida_truncada() {
     assert!(erro.contains("linha-de-erro-numero-1"), "carrega a saída: {erro}");
     assert!(erro.contains("saída truncada"), "e trunca: {erro}");
 }
+
+// ---- exec: o caminho de shell do host ----
+
+#[test]
+fn exec_preserva_exit_code_de_argv_com_aspas() {
+    // A regressão que motivou o teste: juntar argv numa linha e separar de
+    // novo transformava `sh -c "exit 7"` em `sh -c exit 7`, que sai 0 --
+    // todo `if` do agente teria passado a ver sucesso onde houve falha.
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "sh", "-c", "exit 7"])
+        .assert()
+        .code(7);
+}
+
+#[test]
+fn exec_aceita_linha_de_shell_com_metacaractere() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "echo a && exit 3"])
+        .assert()
+        .code(3)
+        .stdout(predicates::str::contains("a"));
+}
+
+#[test]
+fn exec_sai_zero_e_imprime_saida() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "echo", "ok"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("ok"));
+}
+
+#[test]
+fn exec_respeita_denylist_sem_confirm() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "rm", "-rf", "/"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("denylist"));
+}
+
+#[test]
+fn exec_trunca_em_max_output() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--max-output", "40", "--", "sh", "-c", "printf 'x%.0s' $(seq 1 500)"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("truncada"));
+}
+
+#[test]
+fn exec_avisa_quando_passa_de_max_context() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--max-context", "10", "--", "sh", "-c", "printf 'x%.0s' $(seq 1 200)"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("max-context"));
+}
