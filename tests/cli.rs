@@ -272,7 +272,7 @@ fn output_is_truncated_at_cap() {
 
     let output = assert.get_output();
     assert!(output.stdout.len() <= 200);
-    assert!(String::from_utf8_lossy(&output.stderr).contains("truncated"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("truncated"));  // mensagem bilíngue: "output truncated / saída cortada"
 }
 
 #[test]
@@ -1123,9 +1123,13 @@ fn max_context_ajusta_o_limiar_e_zero_desliga() {
 }
 
 #[test]
-fn aviso_de_contexto_nao_trunca_a_saida() {
-    // Avisar e cortar sao coisas diferentes: cortar esconderia resultado, e o
-    // problema nao e a saida existir, e ninguem saber que ela custou caro.
+fn corte_de_contexto_nao_perde_a_saida_inteira() {
+    // A garantia MUDOU, e de propósito. Era "avisa e não corta", porque cortar
+    // esconderia resultado. Só que a telemetria mostrou o aviso sendo ignorado:
+    // 19% das execuções carregavam 88% de todos os bytes. Agora corta -- e a
+    // garantia vira "não PERDE": a cabeça fica no buffer, o inteiro vai pro
+    // arquivo de spill, cujo caminho o aviso nomeia. Nada some; só não é
+    // empurrado pro contexto.
     let dir = tempfile::tempdir().unwrap();
     let s = script_que_despeja(dir.path(), 90_000);
 
@@ -1134,8 +1138,35 @@ fn aviso_de_contexto_nao_trunca_a_saida() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(out.stdout.len() >= 90_000, "saida inteira preservada: {} B", out.stdout.len());
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("output truncated"));
+    assert!(out.stdout.len() <= 65_536 + 512, "cortado no teto: {} B", out.stdout.len());
+
+    let erro = String::from_utf8_lossy(&out.stderr);
+    assert!(erro.contains("saída cortada"), "nomeia o corte: {erro}");
+    let caminho = erro
+        .split("inteira em: ")
+        .nth(1)
+        .and_then(|r| r.lines().next())
+        .expect("aviso nomeia o arquivo de spill");
+    let inteiro = fs::read(caminho.trim()).expect("spill legível");
+    assert!(inteiro.len() >= 90_000 - 65_536, "o excedente está no spill: {} B", inteiro.len());
+}
+
+#[test]
+fn corte_nao_silencia_o_aviso_de_contexto() {
+    // A armadilha da mudança: se o aviso olhasse `buf.len()`, o corte o faria
+    // parar no teto e nunca mais disparar -- o corte silenciaria o alarme que
+    // existe por causa dele. O aviso conta o que o script TENTOU imprimir.
+    let dir = tempfile::tempdir().unwrap();
+    let s = script_que_despeja(dir.path(), 90_000);
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        // O número relatado tem que ser o TENTADO (~90 KB), nunca o teto:
+        // se aparecesse "65536 B de saida", o corte teria silenciado o alarme.
+        .stderr(predicates::str::contains("limiar de contexto"))
+        .stderr(predicates::str::contains("65536 B de saida").not());
 }
 
 #[test]
@@ -1422,3 +1453,24 @@ fn check_avisa_que_cd_nao_persiste() {
         .assert()
         .stderr(predicates::str::contains("cwd"));
 }
+
+// ---- saída: --max-context corta, não só avisa ----
+
+#[test]
+fn max_context_corta_a_saida_e_aponta_o_spill() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"print(read_file("g.txt")); print(read_file("g.txt"));"#).unwrap();
+    fs::write(dir.path().join("g.txt"), "x".repeat(4000)).unwrap();
+
+    cmd()
+        .args(["run"])
+        .arg(&script)
+        .arg("--workdir")
+        .arg(dir.path())
+        .args(["--max-context", "500"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("cortada").and(predicates::str::contains("--max-context")));
+}
+

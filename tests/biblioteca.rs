@@ -126,7 +126,7 @@ fn script_de_uma_primitiva_avisa_e_com_strict_recusa() {
         .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicates::str::contains("Bash direto sai mais barato"))
+        .stderr(predicates::str::contains("codemode exec"))
         .stderr(predicates::str::contains("echo oi"));
 
     let out = cmd(home.path())

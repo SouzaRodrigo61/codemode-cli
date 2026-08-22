@@ -245,7 +245,9 @@ LIMITES
   --cmd-timeout   um comando de shell, 600s (0 = espera blocante)
   --vm-idle       tempo sem primitiva nenhuma: é o que pega `loop {{}}`
   --max-output    corte de segurança, 1 MiB
-  --max-context   AVISA (não corta) acima de 64 KiB: saída também custa token
+  --max-context   CORTA acima de 64 KiB (o inteiro vai pro arquivo de spill,
+                  com cabeça no buffer e cauda no aviso). Saída também custa
+                  token: 19% das execuções carregavam 88% de todos os bytes
   --strict        recusa script que colapsa menos de 2 primitivas
 
 GIT WORKTREE

@@ -29,6 +29,10 @@ pub struct OutputSink {
     /// dizer QUEM despejou, nao so que despejou -- quem escreve o script e
     /// um agente, e ele so corrige na proxima invocacao se souber onde foi.
     pub maior_push: usize,
+    /// Bytes que o script TENTOU imprimir, somados. Desde que `--max-context`
+    /// corta, `buf.len()` para no teto -- usar ele pro aviso faria o corte
+    /// silenciar exatamente o alarme que existe por causa do corte.
+    pub total_tentado: usize,
     spill_file: Option<fs::File>,
 }
 
@@ -40,6 +44,7 @@ impl OutputSink {
             truncated: false,
             spill_path: None,
             maior_push: 0,
+            total_tentado: 0,
             spill_file: None,
         }
     }
@@ -50,6 +55,7 @@ impl OutputSink {
         if s.len() > self.maior_push {
             self.maior_push = s.len();
         }
+        self.total_tentado += s.len();
         if self.truncated {
             self.spill(s);
             return;

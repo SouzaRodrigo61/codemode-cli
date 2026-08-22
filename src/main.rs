@@ -69,9 +69,11 @@ enum Commands {
         /// Print a call log (each primitive invocation) to stderr for debugging.
         #[arg(long)]
         verbose: bool,
-        /// Refuse to run a script that collapses fewer than two primitives:
-        /// wrapping a single call in Rhai costs more than the plain Bash
-        /// call it replaces.
+        /// Recusa script que colapsa menos de duas primitivas. NÃO é o
+        /// padrão: uma primitiva alimentando lógica Rhai de verdade (ler um
+        /// arquivo e decidir em cima dele) é legítima e não fica mais barata
+        /// em shell. O caso que fica é o comando único -- e pra ele existe
+        /// `codemode exec`, que o aviso aponta.
         #[arg(long)]
         strict: bool,
         /// Emit one JSON object (output, exit code, primitive counts,
@@ -417,7 +419,13 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
     let mut engine = primitives::nova_engine();
     primitives::register(&mut engine, sandbox, allow_hosts, counter.clone());
     maestri::register(&mut engine);
-    let sink = primitives::register_output_capture(&mut engine, max_output);
+    // O buffer que vira contexto e capado pelo MENOR dos dois: `--max-output`
+    // continua sendo a guarda de script fugido, e `--max-context` passa a
+    // CORTAR, nao so avisar. Medido na telemetria: 19% das execucoes carregavam
+    // 88% de todos os bytes de saida, e o aviso vinha sendo ignorado. Nada se
+    // perde -- o excedente vai pro arquivo de spill, com cabeca no buffer e
+    // cauda no aviso.
+    let sink = primitives::register_output_capture(&mut engine, max_context.min(max_output));
 
     // Pré-voo: compila, resolve símbolo e linta ANTES da primeira primitiva
     // (#13/#15/#17). Um `Function not found` na linha 8 costumava aparecer
@@ -439,13 +447,20 @@ fn run(script_arg: &str, workdir: &Path, opts: RunOpts, script_args: Vec<String>
     // embrulharam UMA primitiva em Rhai -- custo líquido negativo. Script
     // com laço fica de fora: uma chamada no fonte pode ser N em execução.
     if relatorio.prim_calls < 2 && !relatorio.has_loop {
-        let equivalente = primitiva_unica_como_shell(&source)
-            .map(|c| format!(" -- o equivalente direto é: {c}"))
-            .unwrap_or_default();
-        eprintln!(
-            "codemode: aviso: {} primitiva(s) neste script: Bash direto sai mais barato{}",
-            relatorio.prim_calls, equivalente
-        );
+        // Só é desperdício quando a primitiva única É um comando de shell:
+        // aí `codemode exec` faz o mesmo com o mesmo cinto de segurança e sem
+        // a VM. Uma primitiva alimentando lógica Rhai de verdade (ler um
+        // arquivo e decidir em cima dele) não fica mais barata em shell, e
+        // dizer que fica era conselho errado.
+        match primitiva_unica_como_shell(&source) {
+            Some(c) => eprintln!(
+                "codemode: aviso: 1 comando de shell embrulhado em script -- use `codemode exec -- {c}` (mesmo cinto de segurança, sem a VM)"
+            ),
+            None => eprintln!(
+                "codemode: aviso: {} primitiva(s) neste script -- o ganho do codemode aparece a partir de 2. Se a lógica Rhai justifica, ignore",
+                relatorio.prim_calls
+            ),
+        }
         if strict {
             eprintln!("codemode: --strict: recusado sem executar");
             record_run_com_kind(&meta, &counter, &sink, 2, started, Some(KIND_RECUSADO));
@@ -676,6 +691,7 @@ fn imprime_json(
     // O aviso de contexto (#62) tambem sai no stderr aqui: `--json` e o modo que
     // um agente usa, e era exatamente onde ele nao existia -- a guarda ficava
     // inerte justamente no caminho que ela existe para proteger.
+    let total_tentado = sink.lock().map(|s| s.total_tentado).unwrap_or(0);
     if let Ok(s) = sink.lock() {
         avisa_contexto(&s, max_context);
     }
@@ -685,9 +701,12 @@ fn imprime_json(
         "truncated": truncado,
         // Byte de contexto e o que custa token; quem consome o JSON precisa do
         // numero para decidir, nao so de uma linha em stderr que pode se perder.
-        "out_bytes": saida.len(),
+        // O que o script TENTOU imprimir, não o que sobrou depois do corte:
+        // desde que `--max-context` corta, `saida.len()` para no teto e diria
+        // sempre que estava tudo bem.
+        "out_bytes": total_tentado,
         "max_context": max_context,
-        "over_context": max_context > 0 && saida.len() > max_context,
+        "over_context": max_context > 0 && total_tentado > max_context,
         "largest_print": maior_push,
         "prims": prims,
         "prim_total": prim_total,
@@ -786,7 +805,7 @@ fn record_run_com_kind(
     let prim_total = prims.values().sum();
     // Bytes que de fato chegam ao contexto do chamador -- o buffer impresso,
     // não o spill em disco, que existe justamente para NÃO ser lido.
-    let out_bytes = sink.lock().map(|s| s.buf.len() as u64).unwrap_or(0);
+    let out_bytes = sink.lock().map(|s| s.total_tentado as u64).unwrap_or(0);
     telemetry::record(&telemetry::Entry {
         ts: telemetry::now_secs(),
         script: meta.script.clone(),
@@ -823,18 +842,18 @@ fn record_run_com_kind(
 /// que ela custou caro. Vai pro stderr de proposito -- stdout e a carga que
 /// chega ao contexto, e sujar stdout seria trabalhar contra o proprio aviso.
 fn avisa_contexto(s: &primitives::OutputSink, max_context: usize) {
-    if max_context == 0 || s.buf.len() <= max_context {
+    if max_context == 0 || s.total_tentado <= max_context {
         return;
     }
     eprintln!(
         "codemode: aviso: {} B de saida (limiar de contexto: {} B, ~{}k tokens) -- \
          um script que evita 10 tool-calls e despeja isso no contexto e prejuizo liquido",
-        s.buf.len(),
+        s.total_tentado,
         max_context,
         max_context / 4000
     );
     if s.maior_push > 0 {
-        let fatia = s.maior_push * 100 / s.buf.len().max(1);
+        let fatia = s.maior_push * 100 / s.total_tentado.max(1);
         eprintln!(
             "codemode: a maior impressao unica foi {} B ({}% do total) -- \
              comece por ela; read_file(caminho, #{{lines: \"i-j\"}}) costuma resolver",
@@ -860,8 +879,9 @@ fn print_sink(sink: &primitives::SharedSink, max_context: usize) {
         match &s.spill_path {
             Some(path) => {
                 eprintln!(
-                    "codemode: output truncated at cap ({} bytes); full output: {}",
+                    "codemode: output truncated / saída cortada em {} B ({}); inteira em: {}",
                     s.cap,
+                    if s.cap == max_context { "--max-context" } else { "--max-output" },
                     path.display()
                 );
                 if let Some(tail) = s.tail_preview(512) {
@@ -872,7 +892,7 @@ fn print_sink(sink: &primitives::SharedSink, max_context: usize) {
                 }
             }
             None => eprintln!(
-                "codemode: output truncated at cap ({} bytes); spill unavailable, overflow lost",
+                "codemode: output truncated / saída cortada em {} B; spill indisponível, excedente perdido",
                 s.cap
             ),
         }
