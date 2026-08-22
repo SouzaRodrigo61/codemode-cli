@@ -2,6 +2,7 @@
 //! point of code mode. A script calls these in sequence inside one
 //! process instead of the caller issuing N separate tool-calls.
 
+use std::path::{Path, PathBuf};
 use crate::denylist;
 use crate::sandbox::Sandbox;
 use rhai::{Array, Engine, EvalAltResult, Map};
@@ -28,6 +29,10 @@ pub struct OutputSink {
     /// dizer QUEM despejou, nao so que despejou -- quem escreve o script e
     /// um agente, e ele so corrige na proxima invocacao se souber onde foi.
     pub maior_push: usize,
+    /// Bytes que o script TENTOU imprimir, somados. Desde que `--max-context`
+    /// corta, `buf.len()` para no teto -- usar ele pro aviso faria o corte
+    /// silenciar exatamente o alarme que existe por causa do corte.
+    pub total_tentado: usize,
     spill_file: Option<fs::File>,
 }
 
@@ -39,6 +44,7 @@ impl OutputSink {
             truncated: false,
             spill_path: None,
             maior_push: 0,
+            total_tentado: 0,
             spill_file: None,
         }
     }
@@ -49,6 +55,7 @@ impl OutputSink {
         if s.len() > self.maior_push {
             self.maior_push = s.len();
         }
+        self.total_tentado += s.len();
         if self.truncated {
             self.spill(s);
             return;
@@ -1117,7 +1124,7 @@ fn tenta_pipeline(cmd: &str, sandbox: &Sandbox) -> Option<Result<String, Box<Eva
     Some(Ok(atual))
 }
 
-fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String, Box<EvalAltResult>> {
+fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool, cwd: Option<&Path>) -> Result<String, Box<EvalAltResult>> {
     let _em_voo = marca_em_voo("run_shell", cmd);
     conta_verbo(cmd);
     // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
@@ -1171,8 +1178,10 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
     // and anything the direct spawn can't find.
     // Pipeline simples e redirecionamento resolvidos sem o `sh` no meio
     // (#30). Qualquer coisa fora do subconjunto seguro devolve None aqui e
-    // segue o caminho de sempre.
-    if !sandbox.dry {
+    // segue o caminho de sempre. Com `cwd:` os atalhos ficam de fora: todos
+    // assumem a raiz primária, e um deles rodando no diretório errado seria
+    // pior que perder o atalho.
+    if !sandbox.dry && cwd.is_none() {
         if let Some(resultado) = tenta_pipeline(cmd, sandbox) {
             return resultado;
         }
@@ -1192,14 +1201,14 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
     // Antes de qualquer spawn: o comando trivial resolvido aqui dentro custa
     // 0,02ms contra 1,5-8,5ms de processo (#29). So a forma exata entra.
     if let Some(words) = &plain {
-        if !sandbox.dry {
+        if !sandbox.dry && cwd.is_none() {
             if let Some(resultado) = try_comando_nativo(words, sandbox) {
                 return resultado;
             }
         }
     }
 
-    if routed {
+    if routed && cwd.is_none() {
         if let Some(words) = &plain {
             if let Some(result) = try_in_process_filter(words, sandbox) {
                 return result;
@@ -1208,15 +1217,16 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
     }
 
     let t = sandbox.cmd_timeout;
+    let base: &Path = cwd.unwrap_or(&sandbox.root);
     let sh_fallback = || {
         let mut c = Command::new("sh");
-        c.arg("-c").arg(cmd).current_dir(&sandbox.root);
+        c.arg("-c").arg(cmd).current_dir(base);
         exec_com_deadline(c, t, cmd)
     };
     let output = match &plain {
         Some(words) if routed => {
             let mut c = Command::new("rtk");
-            c.args(words).current_dir(&sandbox.root);
+            c.args(words).current_dir(base);
             match exec_com_deadline(c, t, cmd) {
             Ok(o) => Ok(o),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => sh_fallback(),
@@ -1224,7 +1234,7 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
         }}
         Some(words) => {
             let mut c = Command::new(&words[0]);
-            c.args(&words[1..]).current_dir(&sandbox.root);
+            c.args(&words[1..]).current_dir(base);
             match exec_com_deadline(c, t, cmd) {
             Ok(o) => Ok(o),
             // NotFound covers shell builtins/functions (`command`, `type`,
@@ -1255,7 +1265,7 @@ fn run_shell_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<String,
 /// print/return -> `run_shell` (filtered); output you branch on ->
 /// `run_shell_full` (raw, typed). Same denylist gate, same uncatchable
 /// refusal.
-fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Map, Box<EvalAltResult>> {
+fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool, cwd: Option<&Path>) -> Result<Map, Box<EvalAltResult>> {
     let _em_voo = marca_em_voo("run_shell_full", cmd);
     conta_verbo(cmd);
     // Mutação (ou comando que pode mutar) invalida o cache de resolução (#37).
@@ -1288,15 +1298,16 @@ fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Ma
         shell_words::split(cmd).ok().filter(|w| !w.is_empty())
     };
     let t = sandbox.cmd_timeout;
+    let base: &Path = cwd.unwrap_or(&sandbox.root);
     let sh_fallback = || {
         let mut c = Command::new("sh");
-        c.arg("-c").arg(cmd).current_dir(&sandbox.root);
+        c.arg("-c").arg(cmd).current_dir(base);
         exec_com_deadline(c, t, cmd)
     };
     let output = match &plain {
         Some(words) => {
             let mut c = Command::new(&words[0]);
-            c.args(&words[1..]).current_dir(&sandbox.root);
+            c.args(&words[1..]).current_dir(base);
             match exec_com_deadline(c, t, cmd) {
                 Ok(o) => Ok(o),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => sh_fallback(),
@@ -1316,6 +1327,123 @@ fn run_shell_full_impl(sandbox: &Sandbox, cmd: &str, confirm: bool) -> Result<Ma
     );
     map.insert("success".into(), output.status.success().into());
     Ok(map)
+}
+
+// ---- exec: um comando de shell, o caminho do host ----
+
+/// Um comando de shell pelo mesmo cinto de segurança que as primitivas de
+/// script usam: denylist, `--cmd-timeout`, o mesmo caminho de spawn e o
+/// mesmo roteamento pro RTK. Devolve `(saída combinada, exit code)` em vez
+/// de lançar, porque `exec` É o caminho de shell do host -- quem chama
+/// ramifica no código de saída, e perdê-lo quebraria todo `if` do agente.
+///
+/// Existe pra que "todo comando de shell passa pelo codemode" seja verdade
+/// sem custar mais que o Bash cru: medido em 7 ms de overhead contra
+/// `sh -c`, contra o script Rhai de uma linha que ainda paga a VM.
+pub fn exec_one(sandbox: &Sandbox, argv: &[String], confirm: bool) -> Result<(String, i32), String> {
+    // A linha só existe para a denylist e para o log. NUNCA para re-split:
+    // juntar argv e separar de novo destrói as aspas do chamador, e
+    // `exec -- sh -c "exit 7"` virava `sh -c exit 7`, que sai 0. O host
+    // teria perdido silenciosamente todo código de saída.
+    let linha = argv.join(" ");
+    if !confirm {
+        if let Some(rule) = denylist::check(&linha) {
+            return Err(format!(
+                "exec recusado: o comando casa com a regra '{rule}' da denylist. Passe --confirm se for mesmo o que você quer."
+            ));
+        }
+    }
+    conta_verbo(&linha);
+    let t = sandbox.cmd_timeout;
+
+    // Um argumento só é uma LINHA de shell (pode ter pipe, redirect, `&&`);
+    // dois ou mais já são argv e vão direto, sem shell no meio.
+    let uma_linha = argv.len() == 1;
+    let precisa_shell = uma_linha && SHELL_METACHARS.iter().any(|c| argv[0].contains(*c));
+
+    // Os mesmos atalhos em processo que o caminho de script já tinha, e que
+    // `exec` estava deixando na mesa. Aqui eles valem MAIS: no script o
+    // atalho poupa um spawn; aqui poupa o único spawn que restava, e o
+    // `codemode` deixa de ser mais caro que o shell pros comandos cobertos.
+    // `run_shell` roteado paga codemode -> rtk -> alvo (três processos); o
+    // filtro em processo derruba isso para um.
+    let atalho: Option<Result<String, Box<EvalAltResult>>> = if precisa_shell {
+        None
+    } else {
+        let palavras: Vec<String> = if uma_linha {
+            shell_words::split(&argv[0]).ok().unwrap_or_default()
+        } else {
+            argv.to_vec()
+        };
+        if palavras.is_empty() {
+            None
+        } else {
+            try_comando_nativo(&palavras, sandbox)
+                .or_else(|| try_in_process_filter(&palavras, sandbox))
+        }
+    };
+    // Só o sucesso volta pelo atalho. Na falha ele cai pro spawn de verdade:
+    // o erro do atalho é redigido pro caminho de script ("use run_shell_full()"),
+    // e `exec` é o shell do host -- quem chama espera a saída do comando, não
+    // prosa do codemode. Custa um spawn, e só quando o comando já falhou.
+    if let Some(Ok(s)) = atalho {
+        return Ok((s, 0));
+    }
+
+    let sh_fallback = |linha: &str| {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(linha).current_dir(&sandbox.root);
+        exec_com_deadline(c, t, linha)
+    };
+    if precisa_shell {
+        let output = sh_fallback(&argv[0]).map_err(|e| format!("exec: {e}"))?;
+        return Ok(colhe(output));
+    }
+
+    let palavras: Vec<String> = if uma_linha {
+        shell_words::split(&argv[0]).map_err(|e| format!("exec: {e}"))?
+    } else {
+        argv.to_vec()
+    };
+    if palavras.is_empty() {
+        return Err("exec: comando vazio".into());
+    }
+    // Mesma tabela que o `run_shell` usa: `exec` e o caminho de script
+    // precisam concordar sobre o que vale filtrar, senão o mesmo comando
+    // devolve tamanhos diferentes dependendo de quem chamou.
+    let routed = RTK_WORTH_ROUTING.contains(&palavras[0].as_str())
+        && !grep_shape_rtk_would_passthrough(&palavras)
+        && !saida_ja_e_minima(&palavras);
+    let direto = || {
+        let mut c = Command::new(&palavras[0]);
+        c.args(&palavras[1..]).current_dir(&sandbox.root);
+        exec_com_deadline(c, t, &linha)
+    };
+    let output = if routed {
+        let mut c = Command::new("rtk");
+        c.args(&palavras).current_dir(&sandbox.root);
+        match exec_com_deadline(c, t, &linha) {
+            Ok(o) => Ok(o),
+            // rtk ausente não pode derrubar o shell do host.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => direto(),
+            Err(e) => Err(e),
+        }
+    } else {
+        match direto() {
+            Ok(o) => Ok(o),
+            // builtins e funções de shell só existem dentro de um shell.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => sh_fallback(&linha),
+            Err(e) => Err(e),
+        }
+    }
+    .map_err(|e| format!("exec: {e}"))?;
+    Ok(colhe(output))
+}
+
+fn colhe(output: std::process::Output) -> (String, i32) {
+    let mut saida = String::from_utf8_lossy(&output.stdout).into_owned();
+    saida.push_str(&String::from_utf8_lossy(&output.stderr));
+    (saida, output.status.code().unwrap_or(-1))
 }
 
 // ---- http_get ----
@@ -1441,6 +1569,19 @@ fn http_get_impl(allow: &[String], url: &str) -> Result<Map, Box<EvalAltResult>>
     map.insert("body".into(), body.into());
     map.insert("success".into(), (200..300).contains(&status).into());
     Ok(map)
+}
+
+/// `cwd:` das opções de run_shell/run_shell_full. Resolvido pelo sandbox,
+/// então `@repo2/crates/x` e caminho absoluto dentro de uma raiz valem, e
+/// qualquer coisa fora das raízes é recusada como qualquer outro caminho.
+fn cwd_from_map(sandbox: &Sandbox, opts: &Map) -> Result<Option<PathBuf>, Box<EvalAltResult>> {
+    match opts.get("cwd") {
+        None => Ok(None),
+        Some(v) => {
+            let s = v.clone().into_string().map_err(|_| to_err("cwd: precisa ser string".to_string()))?;
+            Ok(Some(sandbox.dir_confinado(&s).map_err(to_err)?))
+        }
+    }
 }
 
 fn confirm_from_map(opts: &Map) -> bool {
@@ -2037,7 +2178,37 @@ fn corta(s: &str, n: usize) -> String {
 /// atual, então a forma é uma lista de comandos, não um `parallel(itens,
 /// |x| ...)` genérico.
 fn parallel_shell_impl(sandbox: &Sandbox, cmds: Array) -> Result<Array, Box<EvalAltResult>> {
-    let lista: Vec<String> = cmds.iter().map(|c| c.to_string()).collect();
+    // Cada item é uma string (roda na raiz primária, como sempre) OU um mapa
+    // `#{cmd, cwd}`. O mapa existe pro caso que domina o trabalho aqui: o
+    // mesmo comando em N repositórios. Sem cwd por item, um fan-out
+    // multi-repo tinha que virar N chamadas seriais -- e 53% do tempo de
+    // execução medido está justamente em cadeias de 3+ shells em série.
+    let mut lista: Vec<String> = Vec::with_capacity(cmds.len());
+    let mut dirs: Vec<Option<PathBuf>> = Vec::with_capacity(cmds.len());
+    for item in cmds.iter() {
+        if let Some(m) = item.read_lock::<Map>() {
+            let cmd = m
+                .get("cmd")
+                .ok_or_else(|| to_err("parallel_shell: item em mapa precisa de `cmd`".to_string()))?
+                .clone()
+                .into_string()
+                .map_err(|_| to_err("parallel_shell: `cmd` precisa ser string".to_string()))?;
+            let dir = match m.get("cwd") {
+                None => None,
+                Some(v) => {
+                    let s = v.clone().into_string().map_err(|_| {
+                        to_err("parallel_shell: `cwd` precisa ser string".to_string())
+                    })?;
+                    Some(sandbox.dir_confinado(&s).map_err(to_err)?)
+                }
+            };
+            lista.push(cmd);
+            dirs.push(dir);
+        } else {
+            lista.push(item.to_string());
+            dirs.push(None);
+        }
+    }
 
     // Denylist antes de despachar: uma recusa não pode ficar escondida
     // dentro de uma thread e virar erro capturável.
@@ -2055,12 +2226,18 @@ fn parallel_shell_impl(sandbox: &Sandbox, cmds: Array) -> Result<Array, Box<Eval
     let mut saida = Array::new();
     EM_PARALELO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _guarda = GuardaParalelo;
-    for bloco in lista.chunks(limite) {
+    let pares: Vec<(&String, &Option<PathBuf>)> = lista.iter().zip(dirs.iter()).collect();
+    for bloco in pares.chunks(limite) {
         let mut parciais: Vec<Result<Map, String>> = Vec::with_capacity(bloco.len());
         std::thread::scope(|escopo| {
             let handles: Vec<_> = bloco
                 .iter()
-                .map(|cmd| escopo.spawn(move || run_shell_full_impl(sandbox, cmd, false).map_err(|e| e.to_string())))
+                .map(|(cmd, dir)| {
+                    escopo.spawn(move || {
+                        run_shell_full_impl(sandbox, cmd, false, dir.as_deref())
+                            .map_err(|e| e.to_string())
+                    })
+                })
                 .collect();
             for h in handles {
                 parciais.push(h.join().unwrap_or_else(|_| Err("thread do parallel_shell morreu".into())));
@@ -2235,35 +2412,37 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>,
     let ct = counter.clone();
     engine.register_fn("run_shell", move |cmd: &str| -> Result<String, Box<EvalAltResult>> {
         bump(&ct, "run_shell");
-        run_shell_impl(&sb, cmd, false)
+        run_shell_impl(&sb, cmd, false, None)
     });
 
     let sb = sandbox.clone();
     let ct = counter.clone();
     engine.register_fn("run_shell", move |cmd: &str, opts: Map| -> Result<String, Box<EvalAltResult>> {
         bump(&ct, "run_shell");
-        run_shell_impl(&sb, cmd, confirm_from_map(&opts))
+        let cwd = cwd_from_map(&sb, &opts)?;
+        run_shell_impl(&sb, cmd, confirm_from_map(&opts), cwd.as_deref())
     });
 
     let sb = sandbox.clone();
     let ct = counter.clone();
     engine.register_fn("run_shell_full", move |cmd: &str| -> Result<Map, Box<EvalAltResult>> {
         bump(&ct, "run_shell_full");
-        run_shell_full_impl(&sb, cmd, false)
+        run_shell_full_impl(&sb, cmd, false, None)
     });
 
     let sb = sandbox.clone();
     let ct = counter.clone();
     engine.register_fn("run_shell_full", move |cmd: &str, opts: Map| -> Result<Map, Box<EvalAltResult>> {
         bump(&ct, "run_shell_full");
-        run_shell_full_impl(&sb, cmd, confirm_from_map(&opts))
+        let cwd = cwd_from_map(&sb, &opts)?;
+        run_shell_full_impl(&sb, cmd, confirm_from_map(&opts), cwd.as_deref())
     });
 
     let sb = sandbox.clone();
     let ct = counter.clone();
     engine.register_fn("run_shell_confirmed", move |cmd: &str| -> Result<String, Box<EvalAltResult>> {
         bump(&ct, "run_shell_confirmed");
-        run_shell_impl(&sb, cmd, true)
+        run_shell_impl(&sb, cmd, true, None)
     });
 
     let sb = sandbox.clone();
@@ -2291,7 +2470,12 @@ pub fn register(engine: &mut Engine, sandbox: Sandbox, allow_hosts: Vec<String>,
     let sb = sandbox.clone();
     let ct = counter.clone();
     engine.register_fn("parallel_shell", move |cmds: Array| -> Result<Array, Box<EvalAltResult>> {
-        bump(&ct, "parallel_shell");
+        // Conta UMA por comando, não uma pela chamada. Um fan-out de 12
+        // comandos evitou 12 tool-calls; contar 1 fazia `calls_avoided`
+        // dizer ZERO e ainda jogava a execução no bucket de "1 primitiva =
+        // desperdício" -- ou seja, a métrica punia exatamente a forma mais
+        // rápida de fazer o trabalho.
+        bump_n(&ct, "parallel_shell", cmds.len().max(1) as u64);
         parallel_shell_impl(&sb, cmds)
     });
 

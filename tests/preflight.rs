@@ -320,7 +320,7 @@ fn sugestao_de_primitiva_unica_nao_trunca_em_aspa_escapada() {
         .success()
         // A aspa escapada volta ao literal: quem vai colar no shell quer
         // `sh -c "ls -la"`, nao o escape do Rhai.
-        .stderr(predicates::str::contains("o equivalente direto é: sh -c \"ls -la\""));
+        .stderr(predicates::str::contains("codemode exec -- sh -c \"ls -la\""));
 }
 
 #[test]
@@ -333,7 +333,7 @@ fn sugestao_de_primitiva_unica_segue_funcionando_no_comando_simples() {
         .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicates::str::contains("o equivalente direto é: echo ola"));
+        .stderr(predicates::str::contains("codemode exec -- echo ola"));
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn sugestao_de_primitiva_unica_trunca_comando_longo() {
     let erro = String::from_utf8_lossy(&out.stderr);
     let linha = erro
         .lines()
-        .find(|l| l.contains("equivalente direto"))
+        .find(|l| l.contains("codemode exec --"))
         .unwrap_or_else(|| panic!("sem linha de sugestao: {erro}"));
     assert!(linha.contains("..."), "truncou: {linha}");
     assert!(!linha.contains(&"a".repeat(100)), "nao despeja o comando inteiro: {linha}");

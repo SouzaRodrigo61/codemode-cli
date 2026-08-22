@@ -272,7 +272,7 @@ fn output_is_truncated_at_cap() {
 
     let output = assert.get_output();
     assert!(output.stdout.len() <= 200);
-    assert!(String::from_utf8_lossy(&output.stderr).contains("truncated"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("truncated"));  // mensagem bilíngue: "output truncated / saída cortada"
 }
 
 #[test]
@@ -1123,9 +1123,13 @@ fn max_context_ajusta_o_limiar_e_zero_desliga() {
 }
 
 #[test]
-fn aviso_de_contexto_nao_trunca_a_saida() {
-    // Avisar e cortar sao coisas diferentes: cortar esconderia resultado, e o
-    // problema nao e a saida existir, e ninguem saber que ela custou caro.
+fn corte_de_contexto_nao_perde_a_saida_inteira() {
+    // A garantia MUDOU, e de propósito. Era "avisa e não corta", porque cortar
+    // esconderia resultado. Só que a telemetria mostrou o aviso sendo ignorado:
+    // 19% das execuções carregavam 88% de todos os bytes. Agora corta -- e a
+    // garantia vira "não PERDE": a cabeça fica no buffer, o inteiro vai pro
+    // arquivo de spill, cujo caminho o aviso nomeia. Nada some; só não é
+    // empurrado pro contexto.
     let dir = tempfile::tempdir().unwrap();
     let s = script_que_despeja(dir.path(), 90_000);
 
@@ -1134,8 +1138,35 @@ fn aviso_de_contexto_nao_trunca_a_saida() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(out.stdout.len() >= 90_000, "saida inteira preservada: {} B", out.stdout.len());
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("output truncated"));
+    assert!(out.stdout.len() <= 65_536 + 512, "cortado no teto: {} B", out.stdout.len());
+
+    let erro = String::from_utf8_lossy(&out.stderr);
+    assert!(erro.contains("saída cortada"), "nomeia o corte: {erro}");
+    let caminho = erro
+        .split("inteira em: ")
+        .nth(1)
+        .and_then(|r| r.lines().next())
+        .expect("aviso nomeia o arquivo de spill");
+    let inteiro = fs::read(caminho.trim()).expect("spill legível");
+    assert!(inteiro.len() >= 90_000 - 65_536, "o excedente está no spill: {} B", inteiro.len());
+}
+
+#[test]
+fn corte_nao_silencia_o_aviso_de_contexto() {
+    // A armadilha da mudança: se o aviso olhasse `buf.len()`, o corte o faria
+    // parar no teto e nunca mais disparar -- o corte silenciaria o alarme que
+    // existe por causa dele. O aviso conta o que o script TENTOU imprimir.
+    let dir = tempfile::tempdir().unwrap();
+    let s = script_que_despeja(dir.path(), 90_000);
+
+    cmd()
+        .args(["run", s.to_str().unwrap(), "--workdir", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        // O número relatado tem que ser o TENTADO (~90 KB), nunca o teto:
+        // se aparecesse "65536 B de saida", o corte teria silenciado o alarme.
+        .stderr(predicates::str::contains("limiar de contexto"))
+        .stderr(predicates::str::contains("65536 B de saida").not());
 }
 
 #[test]
@@ -1272,4 +1303,232 @@ fn erro_de_run_shell_carrega_a_saida_truncada() {
     assert!(erro.contains("falhou (exit 3)"), "{erro}");
     assert!(erro.contains("linha-de-erro-numero-1"), "carrega a saída: {erro}");
     assert!(erro.contains("saída truncada"), "e trunca: {erro}");
+}
+
+// ---- exec: o caminho de shell do host ----
+
+#[test]
+fn exec_preserva_exit_code_de_argv_com_aspas() {
+    // A regressão que motivou o teste: juntar argv numa linha e separar de
+    // novo transformava `sh -c "exit 7"` em `sh -c exit 7`, que sai 0 --
+    // todo `if` do agente teria passado a ver sucesso onde houve falha.
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "sh", "-c", "exit 7"])
+        .assert()
+        .code(7);
+}
+
+#[test]
+fn exec_aceita_linha_de_shell_com_metacaractere() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "echo a && exit 3"])
+        .assert()
+        .code(3)
+        .stdout(predicates::str::contains("a"));
+}
+
+#[test]
+fn exec_sai_zero_e_imprime_saida() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "echo", "ok"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("ok"));
+}
+
+#[test]
+fn exec_respeita_denylist_sem_confirm() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "rm", "-rf", "/"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("denylist"));
+}
+
+#[test]
+fn exec_trunca_em_max_output() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--max-output", "40", "--", "sh", "-c", "printf 'x%.0s' $(seq 1 500)"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("truncada"));
+}
+
+#[test]
+fn exec_avisa_quando_passa_de_max_context() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--max-context", "10", "--", "sh", "-c", "printf 'x%.0s' $(seq 1 200)"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("max-context"));
+}
+
+// ---- multi-repo: raízes nomeadas e cwd por comando ----
+
+#[test]
+fn cwd_roda_o_comando_na_raiz_nomeada() {
+    // O caso real que motivou tudo: comparar repo 1 com repo 2 sem `cd`.
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    fs::write(a.path().join("quem.txt"), "repo-a").unwrap();
+    fs::write(b.path().join("quem.txt"), "repo-b").unwrap();
+    let script = a.path().join("s.rhai");
+    fs::write(
+        &script,
+        r#"print(trimmed(run_shell("cat quem.txt", #{cwd: "@outro"})));"#,
+    )
+    .unwrap();
+
+    cmd()
+        .args(["run"])
+        .arg(&script)
+        .arg("--workdir")
+        .arg(a.path())
+        .arg("--root")
+        .arg(format!("outro={}", b.path().display()))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("repo-b"));
+}
+
+#[test]
+fn raiz_nomeada_desconhecida_falha_dizendo_o_conserto() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"read_file("@fantasma/x.txt");"#).unwrap();
+
+    cmd()
+        .args(["run"])
+        .arg(&script)
+        .arg("--workdir")
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--root fantasma="));
+}
+
+#[test]
+fn cwd_fora_das_raizes_e_recusado() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"run_shell("ls", #{cwd: "/etc"});"#).unwrap();
+
+    cmd()
+        .args(["run"])
+        .arg(&script)
+        .arg("--workdir")
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("outside sandbox"));
+}
+
+#[test]
+fn check_avisa_que_cd_nao_persiste() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"run_shell("cd crates"); run_shell("ls");"#).unwrap();
+
+    cmd()
+        .args(["check"])
+        .arg(&script)
+        .assert()
+        .stderr(predicates::str::contains("cwd"));
+}
+
+// ---- saída: --max-context corta, não só avisa ----
+
+#[test]
+fn max_context_corta_a_saida_e_aponta_o_spill() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("s.rhai");
+    fs::write(&script, r#"print(read_file("g.txt")); print(read_file("g.txt"));"#).unwrap();
+    fs::write(dir.path().join("g.txt"), "x".repeat(4000)).unwrap();
+
+    cmd()
+        .args(["run"])
+        .arg(&script)
+        .arg("--workdir")
+        .arg(dir.path())
+        .args(["--max-context", "500"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("cortada").and(predicates::str::contains("--max-context")));
+}
+
+
+#[test]
+fn exec_usa_atalho_nativo_mas_falha_cai_pro_shell_de_verdade() {
+    // O atalho em processo tira o spawn do caminho feliz. Na falha ele NÃO
+    // pode responder: o erro dele é redigido pro caminho de script ("use
+    // run_shell_full()"), e `exec` é o shell do host -- quem chama espera a
+    // mensagem do comando e o código dele.
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "cat", "nao-existe.txt"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("run_shell_full").not());
+
+    cmd()
+        .args(["exec", "--workdir"])
+        .arg(dir.path())
+        .args(["--", "false"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn parallel_shell_aceita_cwd_por_item_e_conta_por_comando() {
+    // O fan-out multi-repo: o mesmo comando em N repositórios, de uma vez.
+    // E a métrica tem que contar N, não 1 -- contar 1 fazia `calls_avoided`
+    // dizer zero e jogava a execução no bucket de desperdício, punindo
+    // exatamente a forma mais rápida de fazer o trabalho.
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    fs::write(a.path().join("quem.txt"), "repo-a").unwrap();
+    fs::write(b.path().join("quem.txt"), "repo-b").unwrap();
+    let script = a.path().join("s.rhai");
+    fs::write(
+        &script,
+        r#"let r = parallel_shell([#{cmd: "cat quem.txt"}, #{cmd: "cat quem.txt", cwd: "@outro"}]);
+           print(r[0].stdout + "|" + r[1].stdout);"#,
+    )
+    .unwrap();
+
+    let out = cmd()
+        .args(["run"])
+        .arg(&script)
+        .arg("--workdir")
+        .arg(a.path())
+        .arg("--root")
+        .arg(format!("outro={}", b.path().display()))
+        .arg("--json")
+        .output()
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(j["output"].as_str().unwrap().contains("repo-a|repo-b"), "{j}");
+    assert_eq!(j["prim_total"], 2, "conta um por comando: {j}");
+    assert_eq!(j["calls_avoided"], 1, "{j}");
 }

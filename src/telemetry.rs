@@ -100,6 +100,23 @@ pub fn classify(workdir: &str, name: Option<&str>) -> String {
         if n.starts_with("bench/") || n.contains("/bench/") {
             return "bench".into();
         }
+        // A origem do SCRIPT decide, nao so o workdir. Um benchmark rodado
+        // com `--workdir <repo real>` -- que e como se mede qualquer coisa
+        // util -- entrava como trabalho e inflava justamente o bucket de
+        // desperdicio: 41 execucoes de bench numa unica sessao apareceram
+        // como "1 primitiva, use Bash direto".
+        // O caminho do script vem como o chamador digitou (`/tmp/x.rhai`),
+        // enquanto as raízes são canonicalizadas (`/private/tmp` no macOS):
+        // canonicaliza o ancestral antes de comparar, senão a regra vale no
+        // Linux e não vale aqui.
+        let canon = std::path::Path::new(&n)
+            .parent()
+            .and_then(|d| std::fs::canonicalize(d).ok())
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| n.clone());
+        if em_temporario(&canon) || em_temporario(&n) {
+            return "bench".into();
+        }
     }
     if em_temporario(workdir) {
         return "bench".into();
@@ -206,4 +223,25 @@ pub fn load() -> Vec<Entry> {
     let Some(path) = log_path() else { return Vec::new() };
     let Ok(raw) = std::fs::read_to_string(path) else { return Vec::new() };
     raw.lines().filter_map(|l| serde_json::from_str::<Entry>(l).ok()).collect()
+}
+
+#[cfg(test)]
+mod testes_classificacao {
+    use super::*;
+
+    #[test]
+    fn script_em_tmp_e_bench_mesmo_com_workdir_real() {
+        // A regressão de medição: benchmark rodado com `--workdir <repo real>`
+        // -- que é como se mede qualquer coisa útil -- entrava como trabalho e
+        // inflava justamente o bucket de desperdício do `gain`.
+        let tmp = std::env::temp_dir().join("bench-x.rhai");
+        assert_eq!(classify("/Users/alguem/repo", Some(tmp.to_str().unwrap())), "bench");
+    }
+
+    #[test]
+    fn script_fora_de_tmp_com_workdir_real_continua_real() {
+        let d = std::env::current_dir().unwrap();
+        let s = d.join("nao-existe-mas-nao-e-tmp.rhai");
+        assert_ne!(classify(d.to_str().unwrap(), Some(s.to_str().unwrap())), "bench");
+    }
 }

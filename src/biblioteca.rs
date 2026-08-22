@@ -245,7 +245,9 @@ LIMITES
   --cmd-timeout   um comando de shell, 600s (0 = espera blocante)
   --vm-idle       tempo sem primitiva nenhuma: é o que pega `loop {{}}`
   --max-output    corte de segurança, 1 MiB
-  --max-context   AVISA (não corta) acima de 64 KiB: saída também custa token
+  --max-context   CORTA acima de 64 KiB (o inteiro vai pro arquivo de spill,
+                  com cabeça no buffer e cauda no aviso). Saída também custa
+                  token: 19% das execuções carregavam 88% de todos os bytes
   --strict        recusa script que colapsa menos de 2 primitivas
 
 GIT WORKTREE
@@ -264,6 +266,33 @@ BIBLIOTECA -- os dois diretórios chamados .codemode
   codemode run <nome>.rhai       roda por nome puro
   codemode check <script>        pré-voo sem executar
   codemode run x.rhai --dry-run  anuncia toda escrita/comando, não faz nenhum
+
+MULTI-REPO -- raiz com nome e `cwd:`
+  --root ui=/caminho/thurion-ui      declara a raiz (repetível)
+  read_file("@ui/package.json")      `@nome` vale em qualquer primitiva de caminho
+  glob("@ui/src/**/*.ts")
+  run_shell(cmd, #{{cwd: "@ui"}})      o comando roda LÁ, sem cd
+  run_shell_full(cmd, #{{cwd: "@ui"}})
+  parallel_shell([#{{cmd: "git log -1", cwd: "@ui"}},
+                  #{{cmd: "git log -1", cwd: "@backend"}}])
+                                     o mesmo comando em N repos, de uma vez:
+                                     medido 150ms -> 63ms em 12 comandos
+
+  `cd` NÃO persiste: cada run_shell é um processo novo, e um `cd` que erra
+  derruba o script inteiro. Foi o 2o verbo mais presente em execução que
+  falhou. A resposta é `cwd:`, nunca `cd x && ...`.
+
+  Nome em vez de caminho absoluto é o que torna um script multi-repo
+  versionável em `.codemode/`: com caminho cru ele só roda na máquina de
+  quem escreveu.
+
+UM COMANDO SÓ -- `codemode exec`
+  codemode exec -- <cmd>         um comando pelo mesmo cinto de seguranca:
+                                 denylist, --cmd-timeout, roteamento pro RTK
+                                 e telemetria, saindo com o exit code dele.
+  É o caminho pro shell do host: 7ms de overhead contra `sh -c`, contra a
+  VM inteira que um script Rhai de uma linha paga. `run` continua sendo pra
+  2+ operacoes; `exec` e pra 1.
 
 QUANDO NÃO USAR
   Uma operação só (1 read, 1 edit, 1 comando) é mais barata em Bash direto.

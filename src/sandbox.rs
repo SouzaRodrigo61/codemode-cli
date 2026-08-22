@@ -58,6 +58,11 @@ pub struct Sandbox {
     /// sem isso, toda tarefa que cruza repositório cai fora do codemode.
     /// Cada raiz é confinada individualmente -- não há caminho entre elas.
     pub extra_roots: Vec<PathBuf>,
+    /// Raízes com nome (`--root webapp=/caminho`). O trabalho aqui é
+    /// multi-repo: um script que compara repo 1 com repo 2 tinha que
+    /// carregar caminho absoluto, o que o tornava impossível de versionar
+    /// em `.codemode/`. Com nome, `@webapp/src` vale em qualquer máquina.
+    pub named: std::collections::BTreeMap<String, PathBuf>,
 }
 
 impl Sandbox {
@@ -84,6 +89,32 @@ impl Sandbox {
         Ok(self)
     }
 
+    /// Declara raízes com nome. Cada uma também vira raiz de confinamento:
+    /// nomear sem liberar o acesso não serviria pra nada.
+    pub fn with_named_roots(mut self, pares: &[(String, PathBuf)]) -> Result<Self, String> {
+        for (nome, dir) in pares {
+            if nome.is_empty() || !nome.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return Err(format!("nome de raiz inválido {nome:?}: use letras, números, - e _"));
+            }
+            let canon = std::fs::canonicalize(dir)
+                .map_err(|e| format!("raiz {nome}={dir:?} não existe ou é inacessível: {e}"))?;
+            if !self.extra_roots.contains(&canon) && canon != self.root {
+                self.extra_roots.push(canon.clone());
+            }
+            self.named.insert(nome.clone(), canon);
+        }
+        Ok(self)
+    }
+
+    /// Um diretório existente, dentro de alguma raiz -- o que `cwd:` aceita.
+    pub fn dir_confinado(&self, input: &str) -> Result<PathBuf, String> {
+        let p = self.resolve(input)?;
+        if !p.is_dir() {
+            return Err(format!("cwd {input:?} não é um diretório existente"));
+        }
+        Ok(p)
+    }
+
     /// Raiz primária primeiro: caminho relativo sempre resolve nela.
     fn roots(&self) -> impl Iterator<Item = &PathBuf> {
         std::iter::once(&self.root).chain(self.extra_roots.iter())
@@ -96,7 +127,7 @@ impl Sandbox {
     pub fn new(workdir: &Path) -> Result<Self, String> {
         let root = std::fs::canonicalize(workdir)
             .map_err(|e| format!("workdir {:?} does not exist or is inaccessible: {e}", workdir))?;
-        Ok(Sandbox { root, dry: false, cmd_timeout: 600, cache: CacheResolucao::default(), extra_roots: Vec::new() })
+        Ok(Sandbox { root, dry: false, cmd_timeout: 600, cache: CacheResolucao::default(), extra_roots: Vec::new(), named: std::collections::BTreeMap::new() })
     }
 
     /// Canonicaliza o ancestral existente mais longo e recoloca o resto do
@@ -150,6 +181,27 @@ impl Sandbox {
     }
 
     fn resolve_sem_cache(&self, input: &str) -> Result<PathBuf, String> {
+        // `@nome` e `@nome/resto` viram o caminho absoluto da raiz nomeada
+        // antes de qualquer outra coisa. Nome desconhecido é erro alto, não
+        // um caminho relativo esquisito que falharia três passos depois.
+        let expandido;
+        let input = if let Some(resto) = input.strip_prefix('@') {
+            let (nome, cauda) = match resto.find('/') {
+                Some(i) => (&resto[..i], &resto[i + 1..]),
+                None => (resto, ""),
+            };
+            let raiz = self.named.get(nome).ok_or_else(|| {
+                let conhecidas: Vec<&str> = self.named.keys().map(|s| s.as_str()).collect();
+                format!(
+                    "raiz nomeada @{nome} não foi declarada. Declaradas: {}. Use --root {nome}=<caminho>",
+                    if conhecidas.is_empty() { "(nenhuma)".to_string() } else { conhecidas.join(", ") }
+                )
+            })?;
+            expandido = if cauda.is_empty() { raiz.clone() } else { raiz.join(cauda) };
+            expandido.to_str().ok_or_else(|| "caminho não-UTF8".to_string())?
+        } else {
+            input
+        };
         let p = Path::new(input);
         let candidate = if p.is_absolute() {
             p.to_path_buf()

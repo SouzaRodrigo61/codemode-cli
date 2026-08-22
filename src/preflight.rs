@@ -307,6 +307,21 @@ pub fn shell_com_equivalente(source: &str) -> Vec<String> {
             let resto = &linha[at + gatilho.len()..];
             let Some(fim) = resto.find('"') else { continue };
             let comando = &resto[..fim];
+            // `cd` vem ANTES do corte de comando composto, porque a forma
+            // que mais quebra na prática é justamente a composta: na
+            // telemetria real, `cd` foi o segundo verbo mais presente em
+            // execução que falhou (24 ocorrências), quase sempre como
+            // `cd algum/lugar && make`. Cada run_shell é um processo novo,
+            // então o diretório não sobrevive à chamada -- e um `cd` que
+            // erra derruba o script inteiro.
+            if comando.trim_start().starts_with("cd ") {
+                out.push(format!(
+                    "linha {}: `cd` em run_shell não persiste -- cada chamada é um processo novo. \
+                     Use run_shell(cmd, #{{cwd: \"@repo/sub\"}}) e declare a raiz com --root nome=/caminho",
+                    i + 1
+                ));
+                continue;
+            }
             // Pipe, redirecionamento e encadeamento não têm equivalente
             // direto: a sugestão seria errada.
             if comando.contains('|') || comando.contains('>') || comando.contains("&&") {
