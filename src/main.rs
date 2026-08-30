@@ -134,6 +134,12 @@ enum Commands {
     Hook {
         #[command(subcommand)]
         host: HookHost,
+        /// Prefixo que embrulha a reescrita por fora, virando
+        /// `<wrap> codemode exec -- '<cmd>'`. É o que permite encadear
+        /// outro roteador de shell na MESMA chamada: o host só aceita uma
+        /// reescrita, então dois hooks que reescrevem se apagam.
+        #[arg(long, global = true)]
+        wrap: Option<String>,
     },
     /// Copy the last script you ran (or --from) into `<workdir>/.codemode/`
     /// so it stops being scratchpad litter and starts being a repo asset.
@@ -318,14 +324,14 @@ fn main() {
             });
             std::process::exit(codigo);
         }
-        Commands::Hook { host } => {
+        Commands::Hook { host, wrap } => {
             let mut entrada = String::new();
             let _ = std::io::stdin().read_to_string(&mut entrada);
             // Falha do hook nunca derruba a chamada do host: sem resposta,
             // o comando original segue com a permissão que ele já teria.
             match host {
                 HookHost::Claude => {
-                    if let Some(json) = hook::claude(&entrada) {
+                    if let Some(json) = hook::claude(&entrada, wrap.as_deref()) {
                         println!("{json}");
                     }
                 }

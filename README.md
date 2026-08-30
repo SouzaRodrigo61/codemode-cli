@@ -163,6 +163,23 @@ This replaces `rtk hook <host>` rather than stacking on it — see the
 next section for why the rtk binary no longer needs to be in the path
 of the call.
 
+**A host accepts exactly one rewrite per call.** Two hooks that both
+answer with an `updatedInput` do not compose — the last one to answer
+erases the other, and which one that is, is a race. So chaining a second
+shell router is not a second hook, it is `--wrap`:
+
+```json
+{ "command": "codemode hook claude --wrap \"'/path/to/other' filter --\"" }
+```
+
+which answers `<wrap> codemode exec -- '<cmd>'`. The wrapped program runs
+outermost and sees codemode's already-filtered output; codemode still
+sees the original command, so rtk routing and the telemetry verb stay
+correct (wrapping the other way around would make every command's verb
+the wrapper's own). codemode does not know what the wrapped program is,
+and that is deliberate. The same idempotence guard applies: a command
+that already starts with the wrapped program passes through untouched.
+
 ## RTK lives inside codemode now, not next to it
 
 `run_shell` had two tiers already (a routing allowlist, `rtk`-worth-it commands only) —
