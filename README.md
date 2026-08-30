@@ -163,6 +163,13 @@ This replaces `rtk hook <host>` rather than stacking on it — see the
 next section for why the rtk binary no longer needs to be in the path
 of the call.
 
+`./install.sh` wires both hooks for you (`CODEMODE_NO_HOOKS=1` skips that
+step, `codemode hooks uninstall claude` undoes it). The edit is done by the
+binary — `codemode hooks install claude` — and not by the shell script,
+because editing someone else's JSON from bash would need `jq`, which is not
+guaranteed anywhere. Re-running is idempotent, never duplicates, keeps a
+timestamped backup, and preserves a `--wrap` you configured earlier.
+
 **A host accepts exactly one rewrite per call.** Two hooks that both
 answer with an `updatedInput` do not compose — the last one to answer
 erases the other, and which one that is, is a race. So chaining a second

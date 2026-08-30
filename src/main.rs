@@ -3,6 +3,7 @@ mod denylist;
 mod biblioteca;
 mod gain;
 mod hook;
+mod hooks;
 mod preflight;
 mod maestri;
 mod primitives;
@@ -145,6 +146,26 @@ enum Commands {
         /// formato, para que a linha no settings do host diga o que faz.
         #[arg(long, global = true)]
         post: bool,
+    },
+    /// Liga ou desliga os hooks deste binário no settings do host. É o
+    /// que o `install.sh` chama: mexer em JSON de terceiro em bash exigiria
+    /// `jq`, que não está garantido em máquina nenhuma.
+    Hooks {
+        /// `install` ou `uninstall`.
+        acao: String,
+        /// Host. Hoje só `claude`.
+        #[arg(default_value = "claude")]
+        host: String,
+        /// Prefixo que embrulha a reescrita (ver `hook --wrap`). Sem ele, a
+        /// reinstalação preserva o que já estiver configurado.
+        #[arg(long)]
+        wrap: Option<String>,
+        /// Caminho do settings. Padrão: $CLAUDE_CONFIG_DIR ou ~/.claude.
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        /// Diz o que faria, sem escrever.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
     /// Copy the last script you ran (or --from) into `<workdir>/.codemode/`
     /// so it stops being scratchpad litter and starts being a repo asset.
@@ -352,6 +373,32 @@ fn main() {
                 }
             }
             std::process::exit(0);
+        }
+        Commands::Hooks { acao, host, wrap, settings, dry_run } => {
+            if host != "claude" {
+                eprintln!("codemode hooks: host suportado hoje é `claude` (recebi `{host}`)");
+                std::process::exit(2);
+            }
+            let caminho = settings.unwrap_or_else(hooks::caminho_settings);
+            let r = match acao.as_str() {
+                "install" => hooks::instala(&hooks::Plano {
+                    settings: caminho,
+                    binario: hooks::binario_absoluto(),
+                    wrap,
+                    dry_run,
+                })
+                .map(|linhas| linhas.join("\n")),
+                "uninstall" => hooks::desinstala(&caminho)
+                    .map(|n| format!("{n} hook(s) removido(s) de {}", caminho.display())),
+                outra => {
+                    eprintln!("codemode hooks: ação é `install` ou `uninstall` (recebi `{outra}`)");
+                    std::process::exit(2);
+                }
+            };
+            match r {
+                Ok(msg) => { println!("{msg}"); std::process::exit(0); }
+                Err(e) => { eprintln!("codemode hooks: {e}"); std::process::exit(1); }
+            }
         }
         Commands::Gain { history, json, limit, bench, janela } => {
             match gain::run(gain::GainArgs { history, json, limit, bench, janela }) {

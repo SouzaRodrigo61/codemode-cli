@@ -143,7 +143,7 @@ struct Evento {
     workdir: String,
 }
 
-fn agora() -> u64 {
+pub fn agora() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -298,7 +298,7 @@ pub fn claude_post(entrada: &str) -> Option<String> {
                 None => contagem.push((e.verbo.clone(), 1)),
             }
         }
-        contagem.sort_by(|a, b| b.1.cmp(&a.1));
+        contagem.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
         let dur = ts.saturating_sub(est.eventos.first().map(|e| e.ts).unwrap_or(ts));
         est.avisos += 1;
         // Zera a rajada: sem isso o aviso sairia de novo na chamada

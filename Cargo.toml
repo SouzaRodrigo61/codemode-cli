@@ -1,6 +1,6 @@
 [package]
 name = "codemode"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Code mode CLI: run a Rhai script as one sandboxed batch of file/shell primitives instead of N separate tool-calls."
 license = "MIT"

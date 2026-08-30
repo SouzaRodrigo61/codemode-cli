@@ -40,7 +40,7 @@ CONTEXT_FILES=(
   "OpenCode|$CONTEXT_ROOT/.config/opencode/AGENTS.md"
 )
 
-say "1/3 — building codemode"
+say "1/4 — building codemode"
 cd "$REPO_DIR"
 if ! command -v cargo >/dev/null 2>&1; then
   echo "codemode install: cargo not found. Install Rust (https://rustup.rs) and re-run." >&2
@@ -49,10 +49,17 @@ fi
 cargo build --release --quiet
 ok "built target/release/codemode"
 
-say "2/3 — installing to PATH"
+say "2/4 — installing to PATH"
 mkdir -p "$INSTALL_DIR"
+# rm antes do cp: sobrescrever um binário já mapeado invalida a assinatura
+# ad-hoc e o macOS mata o processo seguinte com SIGKILL, sem mensagem que
+# explique nada. Inode novo + re-assinatura resolve, e em Linux é inócuo.
+rm -f "$INSTALL_DIR/codemode"
 cp target/release/codemode "$INSTALL_DIR/codemode"
 chmod +x "$INSTALL_DIR/codemode"
+if command -v codesign >/dev/null 2>&1; then
+  codesign -f -s - "$INSTALL_DIR/codemode" >/dev/null 2>&1 || true
+fi
 ok "copied to $INSTALL_DIR/codemode"
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ok "$INSTALL_DIR is already on PATH" ;;
@@ -60,7 +67,7 @@ case ":$PATH:" in
      info "  export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
 esac
 
-say "3/3 — wiring detected agent CLIs"
+say "3/4 — wiring detected agent CLIs"
 found_any=false
 for pair in "${CONTEXT_FILES[@]}"; do
   name="${pair%%|*}"
@@ -87,6 +94,26 @@ done
 if [ "$found_any" = false ]; then
   info "no known agent CLI context directories found on this machine — binary is"
   info "still installed and usable, just not auto-wired anywhere"
+fi
+
+say "4/4 — wiring the shell hooks (Claude Code)"
+# O binário faz a edição, não este script: mexer em JSON de terceiro em
+# bash exigiria `jq`, que não está garantido em máquina nenhuma. Aqui só
+# se decide SE roda -- e o passo é o único do instalador que muda como
+# toda chamada de shell do host se comporta, então tem porta de saída.
+CLAUDE_DIR="$CONTEXT_ROOT/.claude"
+if [ -n "${CODEMODE_NO_HOOKS:-}" ]; then
+  info "CODEMODE_NO_HOOKS set — skipped"
+elif [ ! -d "$CLAUDE_DIR" ]; then
+  info "Claude Code not detected (no $CLAUDE_DIR), skipped"
+else
+  # Sem --wrap de propósito: encadeamento é escolha da máquina, e reinstalar
+  # preserva o que já estiver configurado lá.
+  "$INSTALL_DIR/codemode" hooks install claude --settings "$CLAUDE_DIR/settings.json" \
+    | while IFS= read -r line; do ok "$line"; done
+  info "every Bash call now routes through \`codemode exec\` (rtk filter, denylist,"
+  info "output cap, telemetry) and a burst of 5+ commands gets one reminder"
+  info "undo with: codemode hooks uninstall claude"
 fi
 
 echo
