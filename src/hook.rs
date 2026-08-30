@@ -171,12 +171,57 @@ fn desembrulha(cmd: &str) -> &str {
     resto.trim().trim_matches('\'').trim()
 }
 
-fn verbo_de(cmd: &str) -> String {
-    desembrulha(cmd)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string()
+/// Cabeças que invalidam o SEGMENTO inteiro: ou mudam só o shell que as
+/// chama (`cd /x && cargo test` -- o comando é `cargo`), ou abrem um
+/// cabeçalho que não é comando nenhum (`for i in 1 2 3` -- `i` é a
+/// variável do laço, não um programa).
+const PULA_SEGMENTO: &[&str] = &[
+    "cd", "export", "source", ".", "alias", "unalias", "set", "unset", "shift",
+    "pushd", "popd", "umask", "ulimit", "trap",
+    "for", "while", "until", "if", "elif", "case", "select",
+];
+
+/// Cabeças transparentes: o comando de verdade é o próximo token.
+const PULA_TOKEN: &[&str] = &[
+    "do", "then", "else", "done", "fi", "esac", "{", "}", "(", "!", "time",
+    "exec", "sudo", "env", "nohup", "command", "nice", "builtin",
+    // `timeout 600 cargo build`: o número cai na guarda de numérico logo
+    // abaixo e o verbo vira `cargo`, que é o que interessa saber.
+    "timeout", "stdbuf",
+];
+
+fn segmentos(linha: &str) -> Vec<&str> {
+    linha.split(['\n', ';']).flat_map(|p| p.split("&&")).flat_map(|p| p.split("||")).flat_map(|p| p.split('|')).collect()
+}
+
+/// O verbo é o primeiro token que é mesmo um comando. Sem isso a rajada
+/// reportava `cd×5` para cinco chamadas que rodavam coisas diferentes, e
+/// `for` para qualquer laço -- rótulo que esconde justamente o que se
+/// queria ver. Sem consciência de aspas: um `;` dentro de string parte o
+/// segmento no lugar errado. É rótulo, não parser -- e erra para o lado
+/// de mostrar o comando seguinte, nunca de esconder tudo.
+pub fn verbo_de(cmd: &str) -> String {
+    let linha = desembrulha(cmd);
+    for seg in segmentos(linha) {
+        for tok in seg.split_whitespace() {
+            if PULA_SEGMENTO.contains(&tok) {
+                break;
+            }
+            if PULA_TOKEN.contains(&tok) {
+                continue;
+            }
+            // `FOO=1 cmd` e `timeout 600 cargo test`: nem atribuição nem
+            // número são o comando.
+            if tok.contains('=') || tok.parse::<f64>().is_ok() {
+                continue;
+            }
+            let nome = tok.rsplit('/').next().unwrap_or(tok);
+            if !nome.is_empty() {
+                return nome.to_string();
+            }
+        }
+    }
+    linha.split_whitespace().next().unwrap_or_default().to_string()
 }
 
 /// Uma linha por rajada, e ela precisa caber no orçamento que justifica
@@ -478,6 +523,22 @@ mod tests {
         assert_eq!(verbo_de("'/x/caveman' shrink -- codemode exec -- 'git status'"), "git");
         assert_eq!(verbo_de("codemode exec -- 'sed -n 1,5p f'"), "sed");
         assert_eq!(verbo_de("git status"), "git");
+    }
+
+    #[test]
+    fn verbo_pula_cd_keyword_e_prefixo() {
+        // Os dois casos que a rajada reportou errado numa sessão real.
+        assert_eq!(verbo_de("cd /x && cargo test"), "cargo");
+        assert_eq!(verbo_de("for i in 1 2 3; do /usr/bin/time -p sh -c 'x'; done"), "time");
+        // E o resto da classe.
+        assert_eq!(verbo_de("cd /a && cd /b && npm run build"), "npm");
+        assert_eq!(verbo_de("export FOO=1 && ls -la"), "ls");
+        assert_eq!(verbo_de("sudo /usr/local/bin/rtk ls"), "rtk");
+        assert_eq!(verbo_de("timeout 600 cargo build"), "cargo");
+        assert_eq!(verbo_de("RUST_LOG=debug cargo test"), "cargo");
+        assert_eq!(verbo_de("git log | head -3"), "git");
+        // Linha que é SÓ mudança de estado não tem outro verbo: fica o que há.
+        assert_eq!(verbo_de("cd /tmp"), "cd");
     }
 
     #[test]

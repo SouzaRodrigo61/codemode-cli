@@ -304,15 +304,12 @@ fn main() {
                 );
             }
             print!("{saida}");
-            // Primeira PALAVRA, não primeiro argumento: desde que o hook
-            // manda a linha inteira num argumento só (é o que preserva
-            // pipe e `&&`), `cmd.first()` seria a linha completa -- e ela
-            // carrega caminho, header, token. Telemetria aqui é metadado.
-            let verbo = cmd
-                .first()
-                .and_then(|c| c.split_whitespace().next())
-                .unwrap_or_default()
-                .to_string();
+            // Mesmo extrator do hook, e de propósito: `cmd.first()` seria
+            // a linha inteira (o hook manda tudo num argumento só, é o que
+            // preserva pipe e `&&`), e a primeira palavra seria `cd` em
+            // `cd /x && cargo test`. Telemetria aqui é metadado -- verbo,
+            // nunca a linha, que carrega caminho, header e token.
+            let verbo = hook::verbo_de(&cmd.join(" "));
             let workdir_abs = std::fs::canonicalize(&workdir)
                 .unwrap_or_else(|_| workdir.clone()).display().to_string();
             let mut prims = std::collections::BTreeMap::new();
