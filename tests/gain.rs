@@ -297,6 +297,43 @@ fn execucao_em_diretorio_temporario_e_rascunho() {
 }
 
 #[test]
+fn scratchpad_de_agente_dentro_do_temporario_e_trabalho_real() {
+    // O host dá ao agente uma pasta de trabalho dentro do temporário do
+    // sistema. Sem esta exceção, o posto de trabalho que mais roda comando
+    // cai no mesmo balde do benchmark e some do relatório que existe
+    // justamente para responder "vale a pena?".
+    let home = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("sessao-01510593").join("scratchpad").join("live6");
+    fs::create_dir_all(&dir).unwrap();
+    run_in(home.path(), &dir, r#"run_shell("true"); run_shell("true");"#).success();
+
+    let l = linhas(home.path());
+    assert_eq!(l[0]["kind"], "real", "scratchpad de agente é trabalho: {:?}", l[0]);
+
+    let out = Command::cargo_bin("codemode")
+        .unwrap()
+        .env("CODEMODE_HOME", home.path())
+        .arg("gain")
+        .assert()
+        .success();
+    let texto = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(texto.contains("Execuções:                   1"), "{texto}");
+}
+
+#[test]
+fn tmp_sem_scratchpad_continua_rascunho() {
+    // A exceção é o componente `scratchpad`, não "qualquer coisa em /tmp":
+    // uma pasta de nome parecido não pode entrar por acidente de prefixo.
+    let home = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("scratchpad-velho");
+    fs::create_dir_all(&dir).unwrap();
+    run_in(home.path(), &dir, r#"run_shell("true");"#).success();
+    assert_eq!(linhas(home.path())[0]["kind"], "bench");
+}
+
+#[test]
 fn script_sob_bench_nao_conta_como_trabalho_real() {
     let home = tempfile::tempdir().unwrap();
     let dir = dir_de_trabalho("gain_bench_dir");

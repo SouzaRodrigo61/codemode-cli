@@ -84,7 +84,9 @@ impl Entry {
 /// As três regras são gerais, não uma lista de caminhos desta máquina:
 ///
 /// * `bench/...` no nome do script é caso de benchmark, em qualquer repo.
-/// * diretório temporário é rascunho, não trabalho que alguém vai versionar.
+/// * diretório temporário é rascunho, não trabalho que alguém vai versionar
+///   -- **menos** o scratchpad do agente, que é onde o host manda o agente
+///   trabalhar e é trabalho de produto como qualquer outro.
 /// * o codemode se desenvolvendo é detectado pelo `Cargo.toml` do próprio
 ///   workdir declarar `name = "codemode"` -- nenhum caminho fixo envolvido.
 ///
@@ -114,11 +116,11 @@ pub fn classify(workdir: &str, name: Option<&str>) -> String {
             .and_then(|d| std::fs::canonicalize(d).ok())
             .map(|d| d.display().to_string())
             .unwrap_or_else(|| n.clone());
-        if em_temporario(&canon) || em_temporario(&n) {
+        if (em_temporario(&canon) || em_temporario(&n)) && !e_scratchpad_de_agente(&canon) {
             return "bench".into();
         }
     }
-    if em_temporario(workdir) {
+    if em_temporario(workdir) && !e_scratchpad_de_agente(workdir) {
         return "bench".into();
     }
     if e_o_proprio_codemode(workdir) {
@@ -128,6 +130,22 @@ pub fn classify(workdir: &str, name: Option<&str>) -> String {
         return "desconhecido".into();
     }
     "real".into()
+}
+
+/// O host dá ao agente um diretório de trabalho dentro do temporário do
+/// sistema -- e o que acontece lá é trabalho de produto, não rascunho de
+/// benchmark. Sem esta exceção o relatório que existe para responder "vale
+/// a pena?" fica cego justamente para o agente que mais roda comando: numa
+/// medição real, 22 execuções de um posto de trabalho inteiro caíram no
+/// balde de excluídos junto com bench.
+///
+/// A regra é o nome do componente, não um caminho desta máquina: `scratchpad`
+/// é como os hosts chamam essa pasta, e a comparação é por componente para
+/// que `/tmp/scratchpad-velho` não entre por acidente de prefixo.
+fn e_scratchpad_de_agente(caminho: &str) -> bool {
+    std::path::Path::new(caminho)
+        .components()
+        .any(|c| c.as_os_str() == "scratchpad")
 }
 
 fn em_temporario(workdir: &str) -> bool {
