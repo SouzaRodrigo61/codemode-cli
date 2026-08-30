@@ -140,6 +140,11 @@ enum Commands {
         /// reescrita, então dois hooks que reescrevem se apagam.
         #[arg(long, global = true)]
         wrap: Option<String>,
+        /// Trata a entrada como PostToolUse (o payload traz o resultado da
+        /// chamada) em vez de PreToolUse. Explícito, e não deduzido do
+        /// formato, para que a linha no settings do host diga o que faz.
+        #[arg(long, global = true)]
+        post: bool,
     },
     /// Copy the last script you ran (or --from) into `<workdir>/.codemode/`
     /// so it stops being scratchpad litter and starts being a repo asset.
@@ -332,14 +337,19 @@ fn main() {
             });
             std::process::exit(codigo);
         }
-        Commands::Hook { host, wrap } => {
+        Commands::Hook { host, wrap, post } => {
             let mut entrada = String::new();
             let _ = std::io::stdin().read_to_string(&mut entrada);
             // Falha do hook nunca derruba a chamada do host: sem resposta,
             // o comando original segue com a permissão que ele já teria.
             match host {
                 HookHost::Claude => {
-                    if let Some(json) = hook::claude(&entrada, wrap.as_deref()) {
+                    let saida = if post {
+                        hook::claude_post(&entrada)
+                    } else {
+                        hook::claude(&entrada, wrap.as_deref())
+                    };
+                    if let Some(json) = saida {
                         println!("{json}");
                     }
                 }

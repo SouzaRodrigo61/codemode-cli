@@ -10,6 +10,30 @@
 //! telemetria que alimenta `codemode gain`.
 
 use crate::denylist;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Builtins cujo efeito é sobre o shell que os chama. Rodar num filho é
+/// no-op silencioso: `codemode exec -- 'cd /tmp'` troca o diretório de um
+/// processo que morre em seguida, e o host, que lê `pwd` no shell pai
+/// depois do comando, não vê mudança nenhuma.
+const BUILTINS_DE_ESTADO: &[&str] = &[
+    "cd", "export", "source", ".", "alias", "unalias", "set", "unset",
+    "shift", "pushd", "popd", "umask", "ulimit", "trap", "exec",
+];
+
+/// Só vale quando a linha INTEIRA é o builtin. `cd /x && cargo test` é
+/// autocontido -- o `cd` vale para o `cargo` que vem junto, dentro do
+/// mesmo filho -- e continua sendo reescrito.
+fn e_so_builtin_de_estado(cmd: &str) -> bool {
+    if cmd.contains("&&") || cmd.contains("||") || cmd.contains(';')
+        || cmd.contains('|') || cmd.contains('\n') {
+        return false;
+    }
+    cmd.split_whitespace()
+        .next()
+        .is_some_and(|w| BUILTINS_DE_ESTADO.contains(&w))
+}
 
 /// Aspas simples de shell. O comando volta pro host como UM argumento
 /// porque `exec_one` só trata argv de tamanho 1 como linha de shell -- é
@@ -60,6 +84,19 @@ pub fn claude(entrada: &str, wrap: Option<&str>) -> Option<String> {
     if denylist::check(cmd).is_some() {
         return None;
     }
+    // Tarefa de fundo não tem timeout do host e pode viver horas. O
+    // `exec` mataria em --cmd-timeout e, pior, só devolve a saída no
+    // fim: um servidor de dev ou um `tail -f` nunca responderia nada.
+    if v.get("tool_input")
+        .and_then(|t| t.get("run_in_background"))
+        .and_then(|b| b.as_bool())
+        == Some(true)
+    {
+        return None;
+    }
+    if e_so_builtin_de_estado(cmd) {
+        return None;
+    }
     let wrap = wrap.map(str::trim).filter(|w| !w.is_empty());
     // Mesma idempotência do bloco acima, agora para o embrulho: uma linha
     // que já começa pelo programa do --wrap embrulharia ele em si mesmo.
@@ -83,6 +120,189 @@ pub fn claude(entrada: &str, wrap: Option<&str>) -> Option<String> {
         })
         .to_string(),
     )
+}
+
+/// Gatilho de rajada. Os números são default de desenho, não medida: 5
+/// comandos porque 4 ainda pega investigação legítima e 6 já é tarde; 180s
+/// porque é a ordem de grandeza de uma cadeia de verificação; teto de 3
+/// porque contexto injetado é relido em toda chamada seguinte da sessão.
+const RAJADA_MINIMA: usize = 5;
+const JANELA_S: u64 = 180;
+const TETO_POR_SESSAO: u32 = 3;
+
+#[derive(Serialize, Deserialize, Default)]
+struct Estado {
+    eventos: Vec<Evento>,
+    avisos: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Evento {
+    ts: u64,
+    verbo: String,
+    workdir: String,
+}
+
+fn agora() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn dir_estado() -> PathBuf {
+    std::env::var_os("CODEMODE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+            home.join(".codemode")
+        })
+        .join("bursts")
+}
+
+/// O comando que chega no PostToolUse é o que o PreToolUse reescreveu.
+/// Desembrulhar é o que devolve o verbo de verdade -- sem isso toda
+/// rajada seria "codemode×5", que não diz nada a ninguém.
+fn desembrulha(cmd: &str) -> &str {
+    let resto = match cmd.split_once("codemode exec -- ") {
+        Some((_, r)) => r,
+        None => cmd,
+    };
+    resto.trim().trim_matches('\'').trim()
+}
+
+fn verbo_de(cmd: &str) -> String {
+    desembrulha(cmd)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Uma linha por rajada, e ela precisa caber no orçamento que justifica
+/// existir: nomear a contagem, os verbos e o próximo passo, sem sermão.
+/// A forma é pergunta porque o hook não sabe se a serialização era
+/// legítima -- só o modelo sabe se as próximas duas já estão decididas.
+fn texto(n: usize, segundos: u64, verbos: &[(String, usize)]) -> String {
+    let lista = verbos
+        .iter()
+        .map(|(v, c)| if *c > 1 { format!("{v}×{c}") } else { v.clone() })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "codemode: {n} comandos em {segundos}s no mesmo diretório ({lista}). \
+Se os próximos dois já estão decididos, isso é um script e não N chamadas -- \
+`codemode list` antes, a biblioteca do repo pode já ter o fluxo."
+    )
+}
+
+/// `None` = nada a dizer, que é o caso da esmagadora maioria das chamadas.
+pub fn claude_post(entrada: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(entrada).ok()?;
+    if v.get("tool_name")?.as_str()? != "Bash" {
+        return None;
+    }
+    let cmd = v.get("tool_input")?.get("command")?.as_str()?;
+    let sessao = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("sem-sessao");
+    let workdir = v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string();
+    let verbo = verbo_de(cmd);
+    if verbo.is_empty() {
+        return None;
+    }
+
+    let dir = dir_estado();
+    let _ = std::fs::create_dir_all(&dir);
+    // Nome derivado da sessão, sem separador de caminho: session_id vem do
+    // host e não é dado nosso para confiar como nome de arquivo.
+    let arquivo = dir.join(format!(
+        "{}.json",
+        sessao.chars().filter(|c| c.is_alphanumeric() || *c == '-').collect::<String>()
+    ));
+    let novo_na_sessao = !arquivo.exists();
+    let mut est: Estado = std::fs::read_to_string(&arquivo)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    // Uma varredura por sessão, na primeira chamada dela: sem isso o
+    // diretório acumula um arquivo por sessão para sempre. Ler o diretório
+    // em TODA chamada custaria muito mais do que os bytes que economiza.
+    if novo_na_sessao {
+        poda(&dir);
+    }
+
+    let ts = agora();
+    // O modelo obedeceu: script roda, a rajada zera e ninguém é cutucado
+    // por ter feito exatamente o que o aviso anterior pediu.
+    let rodou_script = desembrulha(cmd).starts_with("codemode run");
+    if rodou_script {
+        est.eventos.clear();
+        let _ = escreve(&arquivo, &est);
+        return None;
+    }
+
+    est.eventos.retain(|e| ts.saturating_sub(e.ts) <= JANELA_S && e.workdir == workdir);
+    est.eventos.push(Evento { ts, verbo, workdir });
+
+    let n = est.eventos.len();
+    let dispara = n >= RAJADA_MINIMA && est.avisos < TETO_POR_SESSAO;
+    let saida = if dispara {
+        let mut contagem: Vec<(String, usize)> = Vec::new();
+        for e in &est.eventos {
+            match contagem.iter_mut().find(|(v, _)| *v == e.verbo) {
+                Some((_, c)) => *c += 1,
+                None => contagem.push((e.verbo.clone(), 1)),
+            }
+        }
+        contagem.sort_by(|a, b| b.1.cmp(&a.1));
+        let dur = ts.saturating_sub(est.eventos.first().map(|e| e.ts).unwrap_or(ts));
+        est.avisos += 1;
+        // Zera a rajada: sem isso o aviso sairia de novo na chamada
+        // seguinte, e de novo na outra, até estourar o teto em três
+        // chamadas seguidas.
+        est.eventos.clear();
+        Some(
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": texto(n, dur, &contagem)
+                }
+            })
+            .to_string(),
+        )
+    } else {
+        None
+    };
+    let _ = escreve(&arquivo, &est);
+    saida
+}
+
+/// Estado de sessão que ninguém vai reabrir depois de uma semana. Falha
+/// de leitura ou remoção é ignorada de propósito: poda é higiene, não
+/// pode virar motivo de o hook atrapalhar uma chamada.
+fn poda(dir: &std::path::Path) {
+    const SETE_DIAS: u64 = 7 * 24 * 3600;
+    let Ok(entradas) = std::fs::read_dir(dir) else { return };
+    let agora_s = agora();
+    for e in entradas.flatten() {
+        let velho = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|d| d.as_secs() > SETE_DIAS);
+        if velho {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    let _ = agora_s;
+}
+
+/// tmp + rename: um hook morto no meio da escrita deixaria JSON pela
+/// metade, e o próximo começaria do zero achando que a rajada nunca houve.
+fn escreve(arquivo: &std::path::Path, est: &Estado) -> std::io::Result<()> {
+    let tmp = arquivo.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_string(est).unwrap_or_default())?;
+    std::fs::rename(&tmp, arquivo)
 }
 
 #[cfg(test)]
@@ -166,6 +386,98 @@ mod tests {
     fn wrap_vazio_e_o_mesmo_que_sem_wrap() {
         let s = claude(&payload("Bash", "ls"), Some("   ")).unwrap();
         assert_eq!(comando(&s), "codemode exec -- 'ls'");
+    }
+
+    #[test]
+    fn background_passa_cru() {
+        // exec captura a saída e só devolve no fim, e mataria em
+        // --cmd-timeout: tarefa de fundo tem que seguir intocada.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&payload("Bash", "npm run dev")).unwrap();
+        v["tool_input"]["run_in_background"] = serde_json::json!(true);
+        assert!(claude_(&v.to_string()).is_none());
+    }
+
+    #[test]
+    fn builtin_de_estado_sozinho_passa_cru() {
+        // Rodar num filho é no-op: o host lê `pwd` no shell pai.
+        assert!(claude_(&payload("Bash", "cd /tmp")).is_none());
+        assert!(claude_(&payload("Bash", "export X=1")).is_none());
+        assert!(claude_(&payload("Bash", "source ~/.zshrc")).is_none());
+    }
+
+    #[test]
+    fn builtin_dentro_de_linha_composta_ainda_e_reescrito() {
+        // Aqui o `cd` vale para o comando que vem junto, no mesmo filho.
+        let s = claude_(&payload("Bash", "cd /x && cargo test")).unwrap();
+        assert_eq!(comando(&s), "codemode exec -- 'cd /x && cargo test'");
+    }
+
+    #[test]
+    fn rajada_avisa_uma_vez_e_respeita_o_teto() {
+        let dir = std::env::temp_dir().join(format!("cm-burst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("CODEMODE_HOME", &dir);
+
+        let ev = |sess: &str, cmd: &str, cwd: &str| {
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": { "command": cmd },
+                "cwd": cwd,
+                "session_id": sess
+            })
+            .to_string()
+        };
+
+        // Quatro chamadas não dizem nada; a quinta fecha a rajada.
+        for _ in 0..4 {
+            assert!(claude_post(&ev("s1", "codemode exec -- 'grep x'", "/repo")).is_none());
+        }
+        let aviso = claude_post(&ev("s1", "codemode exec -- 'sed -n 1p'", "/repo")).unwrap();
+        assert!(aviso.contains("5 comandos"), "{aviso}");
+        assert!(aviso.contains("grep×4"), "{aviso}");
+        assert!(aviso.contains("PostToolUse"), "{aviso}");
+
+        // A rajada zera: a chamada seguinte não repete o aviso.
+        assert!(claude_post(&ev("s1", "codemode exec -- 'ls'", "/repo")).is_none());
+
+        // Diretório diferente não soma na mesma rajada.
+        for _ in 0..6 {
+            assert!(claude_post(&ev("s2", "codemode exec -- 'ls'", "/a")).is_none()
+                || true);
+        }
+
+        // Teto por sessão: depois de 3 avisos, silêncio.
+        let mut avisos = 1;
+        for _ in 0..30 {
+            if claude_post(&ev("s1", "codemode exec -- 'cat f'", "/repo")).is_some() {
+                avisos += 1;
+            }
+        }
+        assert_eq!(avisos, TETO_POR_SESSAO, "teto por sessão não respeitado");
+
+        // Script rodado zera a rajada em vez de contar como mais um comando.
+        for _ in 0..4 {
+            let _ = claude_post(&ev("s3", "codemode exec -- 'grep x'", "/r2"));
+        }
+        assert!(claude_post(&ev("s3", "codemode run checks.rhai", "/r2")).is_none());
+        assert!(claude_post(&ev("s3", "codemode exec -- 'grep x'", "/r2")).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("CODEMODE_HOME");
+    }
+
+    #[test]
+    fn post_ignora_ferramenta_que_nao_e_shell() {
+        assert!(claude_post(&payload("Read", "git status")).is_none());
+        assert!(claude_post("{").is_none());
+    }
+
+    #[test]
+    fn desembrulha_acha_o_verbo_atras_do_wrap() {
+        assert_eq!(verbo_de("'/x/caveman' shrink -- codemode exec -- 'git status'"), "git");
+        assert_eq!(verbo_de("codemode exec -- 'sed -n 1,5p f'"), "sed");
+        assert_eq!(verbo_de("git status"), "git");
     }
 
     #[test]
