@@ -299,7 +299,15 @@ fn main() {
                 );
             }
             print!("{saida}");
-            let verbo = cmd.first().cloned().unwrap_or_default();
+            // Primeira PALAVRA, não primeiro argumento: desde que o hook
+            // manda a linha inteira num argumento só (é o que preserva
+            // pipe e `&&`), `cmd.first()` seria a linha completa -- e ela
+            // carrega caminho, header, token. Telemetria aqui é metadado.
+            let verbo = cmd
+                .first()
+                .and_then(|c| c.split_whitespace().next())
+                .unwrap_or_default()
+                .to_string();
             let workdir_abs = std::fs::canonicalize(&workdir)
                 .unwrap_or_else(|_| workdir.clone()).display().to_string();
             let mut prims = std::collections::BTreeMap::new();
