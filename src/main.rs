@@ -2,6 +2,7 @@ mod bench;
 mod denylist;
 mod biblioteca;
 mod gain;
+mod hook;
 mod preflight;
 mod maestri;
 mod primitives;
@@ -20,6 +21,12 @@ use std::time::{Duration, Instant};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Subcommand)]
+enum HookHost {
+    /// Claude Code: JSON do PreToolUse na stdin.
+    Claude,
 }
 
 #[derive(Subcommand)]
@@ -120,6 +127,13 @@ enum Commands {
         /// Run even if the command matches a denylist rule.
         #[arg(long)]
         confirm: bool,
+    },
+    /// PreToolUse hook do host: lê o JSON da chamada na stdin e devolve a
+    /// reescrita que manda o comando por `codemode exec`. Substitui o `rtk
+    /// hook` -- o rtk já roda dentro deste binário.
+    Hook {
+        #[command(subcommand)]
+        host: HookHost,
     },
     /// Copy the last script you ran (or --from) into `<workdir>/.codemode/`
     /// so it stops being scratchpad litter and starts being a repo asset.
@@ -303,6 +317,20 @@ fn main() {
                 workdir: workdir_abs,
             });
             std::process::exit(codigo);
+        }
+        Commands::Hook { host } => {
+            let mut entrada = String::new();
+            let _ = std::io::stdin().read_to_string(&mut entrada);
+            // Falha do hook nunca derruba a chamada do host: sem resposta,
+            // o comando original segue com a permissão que ele já teria.
+            match host {
+                HookHost::Claude => {
+                    if let Some(json) = hook::claude(&entrada) {
+                        println!("{json}");
+                    }
+                }
+            }
+            std::process::exit(0);
         }
         Commands::Gain { history, json, limit, bench, janela } => {
             match gain::run(gain::GainArgs { history, json, limit, bench, janela }) {
