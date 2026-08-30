@@ -134,6 +134,52 @@ other CLIs read it; Claude Code uses `CLAUDE.md` for the same purpose
 configuration). None of this requires touching each tool's internals —
 it's a one-line documentation change plus the binary being on `PATH`.
 
+### Every shell command, without asking the model to remember
+
+The table above is a prompt: it only works while the agent chooses to
+obey it. The shell tool itself can be routed with no prompt at all, by
+a `PreToolUse` hook:
+
+```json
+{ "hooks": { "PreToolUse": [
+  { "matcher": "Bash", "hooks": [{ "type": "command", "command": "codemode hook claude" }] }
+] } }
+```
+
+`codemode hook claude` reads the host's tool-call JSON on stdin and
+answers with the same command rewritten as `codemode exec -- '<cmd>'`.
+The command is quoted into a *single* argument on purpose: `exec_one`
+treats argv-of-one as a shell line, which is what keeps pipes, `&&` and
+redirects intact.
+
+Two cases deliberately produce no answer at all, so the host proceeds
+with the original command and whatever permission decision it would
+have made on its own: anything the denylist matches (rewriting `rm -rf`
+would mean asking for `allow` on exactly what exists to be asked about),
+and anything already starting with `codemode ` or `rtk ` (a second wrap
+would run codemode inside codemode).
+
+This replaces `rtk hook <host>` rather than stacking on it — see the
+next section for why the rtk binary no longer needs to be in the path
+of the call.
+
+**A host accepts exactly one rewrite per call.** Two hooks that both
+answer with an `updatedInput` do not compose — the last one to answer
+erases the other, and which one that is, is a race. So chaining a second
+shell router is not a second hook, it is `--wrap`:
+
+```json
+{ "command": "codemode hook claude --wrap \"'/path/to/other' filter --\"" }
+```
+
+which answers `<wrap> codemode exec -- '<cmd>'`. The wrapped program runs
+outermost and sees codemode's already-filtered output; codemode still
+sees the original command, so rtk routing and the telemetry verb stay
+correct (wrapping the other way around would make every command's verb
+the wrapper's own). codemode does not know what the wrapped program is,
+and that is deliberate. The same idempotence guard applies: a command
+that already starts with the wrapped program passes through untouched.
+
 ## RTK lives inside codemode now, not next to it
 
 `run_shell` had two tiers already (a routing allowlist, `rtk`-worth-it commands only) —

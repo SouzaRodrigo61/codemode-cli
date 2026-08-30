@@ -2,6 +2,7 @@ mod bench;
 mod denylist;
 mod biblioteca;
 mod gain;
+mod hook;
 mod preflight;
 mod maestri;
 mod primitives;
@@ -20,6 +21,12 @@ use std::time::{Duration, Instant};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Subcommand)]
+enum HookHost {
+    /// Claude Code: JSON do PreToolUse na stdin.
+    Claude,
 }
 
 #[derive(Subcommand)]
@@ -120,6 +127,24 @@ enum Commands {
         /// Run even if the command matches a denylist rule.
         #[arg(long)]
         confirm: bool,
+    },
+    /// PreToolUse hook do host: lê o JSON da chamada na stdin e devolve a
+    /// reescrita que manda o comando por `codemode exec`. Substitui o `rtk
+    /// hook` -- o rtk já roda dentro deste binário.
+    Hook {
+        #[command(subcommand)]
+        host: HookHost,
+        /// Prefixo que embrulha a reescrita por fora, virando
+        /// `<wrap> codemode exec -- '<cmd>'`. É o que permite encadear
+        /// outro roteador de shell na MESMA chamada: o host só aceita uma
+        /// reescrita, então dois hooks que reescrevem se apagam.
+        #[arg(long, global = true)]
+        wrap: Option<String>,
+        /// Trata a entrada como PostToolUse (o payload traz o resultado da
+        /// chamada) em vez de PreToolUse. Explícito, e não deduzido do
+        /// formato, para que a linha no settings do host diga o que faz.
+        #[arg(long, global = true)]
+        post: bool,
     },
     /// Copy the last script you ran (or --from) into `<workdir>/.codemode/`
     /// so it stops being scratchpad litter and starts being a repo asset.
@@ -279,7 +304,12 @@ fn main() {
                 );
             }
             print!("{saida}");
-            let verbo = cmd.first().cloned().unwrap_or_default();
+            // Mesmo extrator do hook, e de propósito: `cmd.first()` seria
+            // a linha inteira (o hook manda tudo num argumento só, é o que
+            // preserva pipe e `&&`), e a primeira palavra seria `cd` em
+            // `cd /x && cargo test`. Telemetria aqui é metadado -- verbo,
+            // nunca a linha, que carrega caminho, header e token.
+            let verbo = hook::verbo_de(&cmd.join(" "));
             let workdir_abs = std::fs::canonicalize(&workdir)
                 .unwrap_or_else(|_| workdir.clone()).display().to_string();
             let mut prims = std::collections::BTreeMap::new();
@@ -303,6 +333,25 @@ fn main() {
                 workdir: workdir_abs,
             });
             std::process::exit(codigo);
+        }
+        Commands::Hook { host, wrap, post } => {
+            let mut entrada = String::new();
+            let _ = std::io::stdin().read_to_string(&mut entrada);
+            // Falha do hook nunca derruba a chamada do host: sem resposta,
+            // o comando original segue com a permissão que ele já teria.
+            match host {
+                HookHost::Claude => {
+                    let saida = if post {
+                        hook::claude_post(&entrada)
+                    } else {
+                        hook::claude(&entrada, wrap.as_deref())
+                    };
+                    if let Some(json) = saida {
+                        println!("{json}");
+                    }
+                }
+            }
+            std::process::exit(0);
         }
         Commands::Gain { history, json, limit, bench, janela } => {
             match gain::run(gain::GainArgs { history, json, limit, bench, janela }) {
